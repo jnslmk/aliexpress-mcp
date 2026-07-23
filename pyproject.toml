@@ -1,0 +1,21 @@
+[project]
+name = "aliexpress-mcp"
+version = "0.1.0"
+description = "MCP server for AliExpress product search — self-hosted, no API key"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "fastmcp>=3.4.4",
+    "curl_cffi>=0.7.0",
+]
+
+[project.scripts]
+aliexpress-mcp = "aliexpress_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["aliexpress_mcp"]

@@ -1,0 +1,561 @@
+"""AliExpress client — unofficial, key-less.
+
+There is no official public AliExpress product-search API, so this client mirrors
+what the aliexpress.com web frontend does, using two undocumented-but-stable
+mechanisms (ported from Averyy/fetchaller-mcp, MIT):
+
+* **Search** — fetch the server-rendered search page
+  (``/w/wholesale-<slug>.html``) and pull the product list out of the
+  ``_init_data_`` JSON blob the page embeds for its own hydration.
+
+* **Product detail** — call AliExpress's internal **MTop** API
+  (``acs.aliexpress.com``). MTop requires a ``_m_h5_tk`` token that the site
+  hands out on the first (deliberately unsigned) request, plus an MD5 request
+  signature ``MD5(token & timestamp & appKey & data)``. We bootstrap the token,
+  sign, and auto-refresh it on expiry.
+
+Both are fragile by nature — AliExpress can change the embedded-JSON shape, the
+MTop signing scheme, or start returning anti-bot (``x5sec`` / ``RGV587``)
+challenges from datacenter IPs at any time. Every extractor is written
+defensively and failures degrade to a clear error rather than a crash.
+
+TLS fingerprinting via ``curl_cffi`` (Chrome impersonation) is what lets a
+head-less, browser-less container talk to AliExpress without immediately
+tripping bot detection — no Selenium/Chromium needed, so the container stays
+tiny and its root filesystem read-only.
+
+Market defaults to Germany / EUR / de_DE; override via ``AE_REGION`` /
+``AE_CURRENCY`` / ``AE_LOCALE``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import re
+import threading
+import time
+from typing import Any, Optional
+from urllib.parse import quote
+
+from curl_cffi import requests
+
+log = logging.getLogger("aliexpress-mcp")
+
+# --------------------------------------------------------------------------- #
+# market configuration
+# --------------------------------------------------------------------------- #
+
+REGION = os.getenv("AE_REGION", "DE")
+CURRENCY = os.getenv("AE_CURRENCY", "EUR")
+LOCALE = os.getenv("AE_LOCALE", "de_DE")
+IMPERSONATE = os.getenv("AE_IMPERSONATE", "chrome")
+
+# The cookie AliExpress reads for ship-to region, display currency and locale.
+# Setting it makes both the SSR search page and the MTop API answer in EUR / de_DE.
+_USUC_COOKIE = f"site=glo&c_tp={CURRENCY}&region={REGION}&b_locale={LOCALE}"
+
+_BASE_HEADERS = {
+    "Accept-Language": f"{LOCALE.replace('_', '-')},{LOCALE.split('_')[0]};q=0.9,en;q=0.8",
+    "Referer": "https://www.aliexpress.com/",
+}
+
+# --------------------------------------------------------------------------- #
+# MTop constants
+# --------------------------------------------------------------------------- #
+
+_MTOP_BASE = "https://acs.aliexpress.com"
+_APP_KEY = "12574478"
+_TOKEN_TTL = 3000  # seconds (~50 min); AliExpress issues ~60 min tokens
+# Product-detail APIs, tried in order. pdp.pc.query is the modern PC endpoint.
+_MTOP_APIS = [
+    ("mtop.aliexpress.pdp.pc.query", "1.0"),
+    ("mtop.aliexpress.itemdetail.pc.asyncPCDetail", "1.0"),
+]
+
+_PRODUCT_ID_RE = re.compile(r"(?:aliexpress\.com/item/|(?<!\d))(\d{8,20})(?!\d)")
+
+
+def extract_product_id(value: str) -> Optional[str]:
+    """Pull the numeric product id out of a bare id or any AliExpress URL."""
+    m = _PRODUCT_ID_RE.search(value or "")
+    return m.group(1) if m else None
+
+
+# --------------------------------------------------------------------------- #
+# shared curl_cffi session (thread-safe)
+# --------------------------------------------------------------------------- #
+
+_session: Optional[requests.Session] = None
+_session_lock = threading.Lock()
+
+
+def _get_session() -> requests.Session:
+    global _session
+    if _session is None:
+        with _session_lock:
+            if _session is None:
+                s = requests.Session(impersonate=IMPERSONATE)
+                s.headers.update(_BASE_HEADERS)
+                s.cookies.set("aep_usuc_f", _USUC_COOKIE, domain=".aliexpress.com")
+                _session = s
+    return _session
+
+
+# --------------------------------------------------------------------------- #
+# embedded-JSON extraction (SSR search page)
+# --------------------------------------------------------------------------- #
+
+
+def _extract_json_object(html: str, start: int, max_scan: int = 3_000_000) -> Optional[dict]:
+    """String-aware brace counting to slice one JSON object out of HTML.
+
+    Regex is unreliable on the 400 KB+ ``_init_data_`` payload, so we walk from
+    the opening brace tracking string state until the matching close brace.
+    """
+    depth = 0
+    in_string = False
+    escape = False
+    end = min(start + max_scan, len(html))
+    for i in range(start, end):
+        ch = html[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(html[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _extract_init_data(html: str) -> Optional[dict]:
+    """Locate and parse the ``_init_data_`` object embedded in a search page."""
+    # Strategy 1: HTML comment markers around the hydration script (most reliable).
+    start_idx = html.find("init-data-start")
+    end_idx = html.find("init-data-end")
+    if start_idx != -1 and end_idx != -1:
+        data_offset = html.find("data:", start_idx)
+        if data_offset != -1 and data_offset < end_idx:
+            json_start = html.find("{", data_offset + 5)
+            if json_start != -1 and json_start < end_idx:
+                result = _extract_json_object(html, json_start, end_idx - json_start + 100)
+                if result is not None:
+                    return result
+    # Strategy 2: direct ``_dida_config_._init_data_=`` assignment.
+    assign_idx = html.find("_dida_config_._init_data_=")
+    if assign_idx == -1:
+        return None
+    data_idx = html.find("data:", assign_idx + 26)
+    if data_idx == -1 or data_idx - assign_idx > 50:
+        return None
+    json_start = html.find("{", data_idx + 5)
+    if json_start == -1:
+        return None
+    return _extract_json_object(html, json_start, 2_000_000)
+
+
+# --------------------------------------------------------------------------- #
+# search
+# --------------------------------------------------------------------------- #
+
+_SORT_MAP = {
+    None: None,
+    "default": None,
+    "relevance": None,
+    "orders": "total_tranpro_desc",
+    "sold": "total_tranpro_desc",
+    "price_asc": "price_asc",
+    "price_desc": "price_desc",
+    "newest": "create_desc",
+}
+
+
+def _img_url(raw: Optional[str]) -> Optional[str]:
+    """Normalise a protocol-relative AliExpress CDN url to https."""
+    if not raw:
+        return None
+    if raw.startswith("//"):
+        return "https:" + raw
+    return raw
+
+
+def _parse_search_item(product: dict) -> dict:
+    """Flatten one ``_init_data_`` product entry into a clean dict."""
+    pid = str(product.get("productId") or product.get("redirectedId") or "")
+
+    title_mod = product.get("title") or {}
+    if isinstance(title_mod, dict):
+        title = title_mod.get("displayTitle") or title_mod.get("seoTitle") or ""
+    else:
+        title = str(title_mod)
+
+    prices = product.get("prices") or {}
+    sale = prices.get("salePrice") or {}
+    original = prices.get("originalPrice") or {}
+
+    evaluation = product.get("evaluation") or {}
+    trade = product.get("trade") or {}
+    image = product.get("image") or {}
+
+    return {
+        "id": pid,
+        "title": title,
+        "price": sale.get("minPrice"),
+        "price_formatted": sale.get("formattedPrice"),
+        "currency": sale.get("currencyCode") or CURRENCY,
+        "original_price": original.get("minPrice"),
+        "discount_pct": sale.get("discount"),
+        "rating": evaluation.get("starRating"),
+        "orders": trade.get("tradeDesc"),
+        "image": _img_url(image.get("imgUrl")),
+        "url": f"https://www.aliexpress.com/item/{pid}.html" if pid else None,
+    }
+
+
+def search(
+    query: str,
+    limit: int = 10,
+    sort: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    page: int = 1,
+) -> dict:
+    """Search AliExpress via the SSR search page. Raises AliExpressError on block."""
+    query_slug = quote((query or "").strip().replace(" ", "-"), safe="-")
+    url = f"https://www.aliexpress.com/w/wholesale-{query_slug}.html"
+    params = {"page": str(max(1, page))}
+    sort_type = _SORT_MAP.get(sort, None)
+    if sort_type:
+        params["sortType"] = sort_type
+    if min_price is not None:
+        params["minPrice"] = str(min_price)
+    if max_price is not None:
+        params["maxPrice"] = str(max_price)
+
+    session = _get_session()
+    try:
+        resp = session.get(url, params=params, timeout=30)
+    except Exception as exc:  # noqa: BLE001 - surface any transport error cleanly
+        raise AliExpressError(f"search request failed: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise AliExpressError(f"search returned HTTP {resp.status_code}")
+
+    html = resp.text
+    init_data = _extract_init_data(html)
+    if not init_data:
+        if "_____tmd_____" in html or "punish" in html.lower():
+            raise AliExpressError(
+                "blocked by AliExpress anti-bot (TMD challenge) — the search page "
+                "returned a punish/verification page instead of results."
+            )
+        raise AliExpressError(
+            "could not locate product data in the search page "
+            f"(received {len(html)} chars of HTML)."
+        )
+
+    try:
+        root_fields = init_data["data"]["root"]["fields"]
+        mods = root_fields.get("mods", {})
+        raw_items = mods.get("itemList", {}).get("content", []) or []
+        page_info = root_fields.get("pageInfo", {})
+        total = page_info.get("totalResults", len(raw_items))
+        cur_page = page_info.get("page", page)
+    except (KeyError, TypeError) as exc:
+        raise AliExpressError(f"unexpected search data structure: {exc}") from exc
+
+    items = [_parse_search_item(p) for p in raw_items[: max(1, limit)]]
+    return {
+        "query": query,
+        "region": REGION,
+        "currency": CURRENCY,
+        "page": cur_page,
+        "total": total,
+        "returned": len(items),
+        "items": items,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# MTop client (product detail)
+# --------------------------------------------------------------------------- #
+
+_token: str = ""
+_token_time: float = 0.0
+_token_lock = threading.Lock()
+
+
+class AliExpressError(RuntimeError):
+    """Raised when AliExpress blocks the request or returns no usable data."""
+
+
+def _sign(token: str, timestamp: str, data_str: str) -> str:
+    return hashlib.md5(f"{token}&{timestamp}&{_APP_KEY}&{data_str}".encode()).hexdigest()
+
+
+def _token_expired() -> bool:
+    return not _token or (time.time() - _token_time) > _TOKEN_TTL
+
+
+def _mtop_get(api: str, version: str, data_dict: dict) -> dict:
+    """One signed MTop GET. Updates the shared token from the response cookie."""
+    global _token, _token_time
+    session = _get_session()
+    timestamp = str(int(time.time() * 1000))
+    data_str = json.dumps(data_dict, separators=(",", ":"))
+    sign = _sign(_token, timestamp, data_str)
+    url = f"{_MTOP_BASE}/h5/{api}/{version}/"
+    params = {
+        "jsv": "2.5.1",
+        "appKey": _APP_KEY,
+        "t": timestamp,
+        "sign": sign,
+        "api": api,
+        "v": version,
+        "timeout": "5000",
+        "type": "originaljson",
+        "dataType": "json",
+        "data": data_str,
+    }
+    resp = session.get(url, params=params, timeout=15)
+
+    tk = resp.cookies.get("_m_h5_tk")
+    if tk:
+        new_token = tk.split("_")[0]
+        if new_token != _token:
+            _token = new_token
+            _token_time = time.time()
+
+    body = resp.text
+    jsonp = re.match(r"^\s*\w+\(([\s\S]+)\)\s*;?\s*$", body)
+    if jsonp:
+        body = jsonp.group(1)
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return {"ret": ["PARSE_ERROR"], "data": {}}
+
+
+def _bootstrap_token() -> None:
+    """Get an initial ``_m_h5_tk`` by making one deliberately unsigned request.
+
+    The server answers FAIL_SYS_TOKEN_EMPTY and sets the token cookie, which the
+    signed request then uses. Only real API endpoints set the cookie.
+    """
+    global _token, _token_time
+    with _token_lock:
+        if not _token_expired():
+            return
+        _token = ""
+        _mtop_get("mtop.aliexpress.pdp.pc.query", "1.0", {})
+        if not _token:
+            log.warning("MTop token bootstrap did not yield an _m_h5_tk cookie")
+
+
+def _ret_str(result: dict) -> str:
+    ret = result.get("ret", [])
+    return " ".join(ret) if isinstance(ret, list) else str(ret)
+
+
+def _mtop_request(api: str, version: str, data_dict: dict) -> dict:
+    """Signed MTop request with token bootstrap + one refresh on token expiry."""
+    if _token_expired():
+        _bootstrap_token()
+
+    result = _mtop_get(api, version, data_dict)
+    ret = _ret_str(result)
+
+    if "FAIL_SYS_TOKEN_EXPIRED" in ret or "FAIL_SYS_TOKEN_EXOIRED" in ret or "FAIL_SYS_TOKEN_EMPTY" in ret:
+        with _token_lock:
+            global _token
+            _token = ""
+        _bootstrap_token()
+        result = _mtop_get(api, version, data_dict)
+
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# product-detail extraction
+# --------------------------------------------------------------------------- #
+
+
+def _extract_product(result: dict) -> Optional[dict]:
+    """Turn a pdp.pc.query MTop response into a clean product dict."""
+    data = result.get("data", {})
+    r = data.get("result", data)
+    if not isinstance(r, dict):
+        return None
+
+    global_data = (r.get("GLOBAL_DATA") or {}).get("globalData", {})
+
+    title_mod = r.get("PRODUCT_TITLE") or {}
+    title = title_mod.get("text") or global_data.get("subject") or ""
+    if not title:
+        return None
+
+    # --- pricing (selected sku + all variants) ---
+    price_mod = r.get("PRICE") or {}
+    sku_price_map = price_mod.get("skuIdStrPriceInfoMap") or {}
+    selected_sku = str(price_mod.get("selectedSkuId") or "")
+
+    def _price_entry(entry: dict) -> dict:
+        orig = entry.get("originalPrice") or {}
+        return {
+            "sale_price": entry.get("salePriceString"),
+            "original_price": orig.get("formatedAmount"),
+            "original_value": orig.get("value"),
+            "currency": orig.get("currency") or CURRENCY,
+        }
+
+    price: dict = {}
+    variants_pricing = []
+    for sku_id, entry in list(sku_price_map.items())[:25]:
+        pe = _price_entry(entry)
+        pe["sku_id"] = sku_id
+        variants_pricing.append(pe)
+        if sku_id == selected_sku or not price:
+            price = {k: v for k, v in pe.items() if k != "sku_id"}
+
+    # --- rating / orders ---
+    rating_mod = r.get("PC_RATING") or {}
+    rating = rating_mod.get("rating")
+    review_count = rating_mod.get("totalValidNum")
+    orders = rating_mod.get("otherText")
+
+    # --- store ---
+    shop = r.get("SHOP_CARD_PC") or {}
+    seller_info = shop.get("sellerInfo") or {}
+    store = {
+        "name": shop.get("storeName"),
+        "positive_rate": shop.get("sellerPositiveRate"),
+        "score": shop.get("sellerScore"),
+        "country": seller_info.get("countryCompleteName"),
+        "opened_year": seller_info.get("openedYear"),
+        "url": _img_url(seller_info.get("storeURL")),
+    }
+
+    # --- images ---
+    img_mod = r.get("HEADER_IMAGE_PC") or {}
+    images = [i for i in (img_mod.get("imagePathList") or []) if i][:12]
+
+    # --- shipping (best effort) ---
+    shipping: dict = {}
+    ship_mod = r.get("SHIPPING") or {}
+    oll = ship_mod.get("originalLayoutResultList") or []
+    if oll and isinstance(oll, list):
+        biz = (oll[0] or {}).get("bizData") or {}
+        shipping = {
+            "ship_from": biz.get("shipFrom"),
+            "ship_to": biz.get("shipToCode"),
+            "delivery_days_max": biz.get("deliveryDayMax"),
+            "eta": biz.get("displayEtaMinDate"),
+            "amount": biz.get("displayAmount") or biz.get("shippingFee"),
+        }
+
+    # --- variants (sku options) ---
+    variants = []
+    sku_mod = r.get("SKU") or {}
+    for prop in sku_mod.get("skuProperties") or []:
+        name = prop.get("skuPropertyName")
+        values = [
+            v.get("propertyValueDisplayName") or v.get("propertyValueName")
+            for v in prop.get("skuPropertyValues") or []
+        ]
+        values = [v for v in values if v]
+        if name and values:
+            variants.append({"name": name, "values": values[:30]})
+
+    # --- specifications ---
+    specs = {}
+    prop_mod = r.get("PRODUCT_PROP_PC") or {}
+    for s in (prop_mod.get("showedProps") or prop_mod.get("outerProps") or [])[:30]:
+        name = s.get("attrName") or s.get("name")
+        value = s.get("attrValue") or s.get("value")
+        if name and value:
+            specs[name] = value
+
+    # --- stock ---
+    qty_mod = r.get("QUANTITY_PC") or {}
+    stock = qty_mod.get("totalAvailableInventory")
+
+    pid = str(global_data.get("productId") or "")
+    return {
+        "id": pid,
+        "title": title,
+        "url": f"https://www.aliexpress.com/item/{pid}.html" if pid else None,
+        "price": price,
+        "rating": rating,
+        "review_count": review_count,
+        "orders": orders,
+        "stock": stock,
+        "store": store,
+        "shipping": shipping,
+        "variants": variants,
+        "variants_pricing": variants_pricing,
+        "specs": specs,
+        "images": images,
+        "category_path": global_data.get("categoryPath"),
+    }
+
+
+def get_product(product: str) -> dict:
+    """Fetch full product detail for a numeric id or AliExpress URL."""
+    pid = extract_product_id(product)
+    if not pid:
+        raise AliExpressError(f"could not extract a product id from: {product!r}")
+
+    data = {
+        "productId": pid,
+        "_lang": LOCALE,
+        "_currency": CURRENCY,
+        "country": REGION,
+        "clientType": "pc",
+    }
+
+    last_ret = ""
+    for api, version in _MTOP_APIS:
+        try:
+            result = _mtop_request(api, version, data)
+        except Exception as exc:  # noqa: BLE001
+            last_ret = str(exc)
+            continue
+        ret = _ret_str(result)
+        last_ret = ret
+        if "SUCCESS" in ret:
+            inner = (result.get("data", {}).get("result", {}) or {})
+            gd = (inner.get("GLOBAL_DATA") or {}).get("globalData", {})
+            if gd.get("errorCode") == "SITEM_NOT_EXIST":
+                raise AliExpressError(f"product {pid} not found (delisted or unavailable)")
+            extracted = _extract_product(result)
+            if extracted and extracted.get("title"):
+                return extracted
+            continue
+        if "FAIL_SYS_USER_VALIDATE" in ret or "RGV587_ERROR" in ret:
+            raise AliExpressError(
+                "blocked by AliExpress anti-bot (x5sec/RGV587) — MTop rejected the "
+                "signed request. Datacenter IPs are challenged more aggressively."
+            )
+
+    raise AliExpressError(f"could not retrieve product {pid} (last MTop status: {last_ret})")
+
+
+def liveness() -> dict:
+    """Cheap process-level liveness. Does not touch AliExpress (no dependency)."""
+    return {"status": "ok", "region": REGION, "currency": CURRENCY, "locale": LOCALE}
