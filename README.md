@@ -42,6 +42,7 @@ vars (defaults in **bold**):
 | `AE_REGION` | **`DE`** | Ship-to region |
 | `AE_CURRENCY` | **`EUR`** | Display currency |
 | `AE_LOCALE` | **`de_DE`** | Language / localisation |
+| `AE_MAX_CONCURRENT` | **`2`** | Process-wide cap on concurrent requests to AliExpress (0.1.1+). Chat agents fire several tool calls in parallel; the excess queue instead of hitting AliExpress at once, which is what trips its anti-bot (x5sec / TMD). |
 
 These are pushed to AliExpress via the `aep_usuc_f` cookie (search) and the
 `_lang` / `_currency` / `country` MTop params (product detail). Any market the

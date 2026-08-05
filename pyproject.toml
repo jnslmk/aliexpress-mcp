@@ -1,6 +1,6 @@
 [project]
 name = "aliexpress-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for AliExpress product search — self-hosted, no API key"
 readme = "README.md"
 requires-python = ">=3.12"

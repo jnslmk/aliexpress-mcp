@@ -34,9 +34,53 @@ from aliexpress_mcp.aliexpress_client import (
 
 log = logging.getLogger("aliexpress-mcp")
 
+
+def _coerce_int(
+    value: str | int | None, field: str, *, ge: int | None = None
+) -> int | None:
+    """Coerce the numeric strings LLMs routinely send for int parameters.
+
+    FastMCP validates tool input against the JSON schema before the function
+    runs, so a parameter typed ``int`` rejects the string ``"600"`` outright
+    (the same bug kleinanzeigen-mcp 0.1.1 and geizhals-mcp 0.1.3 fixed).
+    Accepting ``str | int`` in the schema and normalising here keeps the
+    model-facing contract lenient while the client still sees a real int.
+    """
+    if value is None or isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            result = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an integer, got {value!r}") from exc
+    else:
+        raise ValueError(f"{field} must be an integer, got {value!r}")
+    if ge is not None and result is not None and result < ge:
+        raise ValueError(f"{field} must be >= {ge}, got {result}")
+    return result
+
+
+def _coerce_float(
+    value: str | float | None, field: str, *, ge: float | None = None
+) -> float | None:
+    """Coerce numeric strings for float parameters (prices). See _coerce_int."""
+    if value is None or isinstance(value, (int, float)):
+        result = float(value) if value is not None else None
+    elif isinstance(value, str) and value.strip():
+        try:
+            result = float(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field} must be a number, got {value!r}") from exc
+    else:
+        raise ValueError(f"{field} must be a number, got {value!r}")
+    if ge is not None and result is not None and result < ge:
+        raise ValueError(f"{field} must be >= {ge}, got {result}")
+    return result
+
+
 mcp = FastMCP(
     name="aliexpress",
-    version="0.1.0",
+    version="0.1.1",
     instructions=(
         "Search AliExpress and inspect product listings. This is key-less and "
         f"scoped to the {REGION} market, so prices are in {CURRENCY} and titles "
@@ -63,7 +107,7 @@ def search_aliexpress(
         Field(description="Search keywords, e.g. 'usb c kabel' or 'anker powerbank'"),
     ],
     limit: Annotated[
-        int, Field(description="Maximum results to return (one page holds ~60)", ge=1, le=60)
+        str | int, Field(description="Maximum results to return (one page holds ~60)")
     ] = 10,
     sort: Annotated[
         Optional[str],
@@ -76,15 +120,15 @@ def search_aliexpress(
         ),
     ] = None,
     min_price: Annotated[
-        Optional[float],
+        str | float | None,
         Field(description=f"Minimum price filter, in {CURRENCY}."),
     ] = None,
     max_price: Annotated[
-        Optional[float],
+        str | float | None,
         Field(description=f"Maximum price filter, in {CURRENCY}."),
     ] = None,
     page: Annotated[
-        int, Field(description="Result page (1-indexed), ~60 items per page.", ge=1)
+        str | int, Field(description="Result page (1-indexed), ~60 items per page.")
     ] = 1,
 ) -> dict[str, Any]:
     """Search AliExpress product listings by keyword.
@@ -94,6 +138,10 @@ def search_aliexpress(
     Prices and titles follow the configured market (Germany / EUR by default).
     Pass a product's `id` to `get_aliexpress_product` for full details.
     """
+    limit = min(_coerce_int(limit, "limit", ge=1) or 10, 60)
+    page = _coerce_int(page, "page", ge=1) or 1
+    min_price = _coerce_float(min_price, "min_price", ge=0)
+    max_price = _coerce_float(max_price, "max_price", ge=0)
     try:
         return search(
             query=query,

@@ -104,6 +104,16 @@ def _get_session() -> requests.Session:
     return _session
 
 
+# Process-wide cap on concurrent AliExpress interactions. Chat agents fire
+# several tool calls in parallel, and a burst of simultaneous requests from a
+# datacenter IP is the fastest way to trip AliExpress's anti-bot (x5sec / TMD
+# punish pages — observed from this very host). FastMCP runs the sync tools in
+# a thread pool, so this is a threading gate, not an asyncio one: excess calls
+# queue here instead of hitting AliExpress at once.
+MAX_CONCURRENT = int(os.getenv("AE_MAX_CONCURRENT", "2"))
+_gate = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+
 # --------------------------------------------------------------------------- #
 # embedded-JSON extraction (SSR search page)
 # --------------------------------------------------------------------------- #
@@ -229,6 +239,26 @@ def _parse_search_item(product: dict) -> dict:
 
 
 def search(
+    query: str,
+    limit: int = 10,
+    sort: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    page: int = 1,
+) -> dict:
+    """Search AliExpress via the SSR search page. Raises AliExpressError on block."""
+    with _gate:
+        return _search(
+            query=query,
+            limit=limit,
+            sort=sort,
+            min_price=min_price,
+            max_price=max_price,
+            page=page,
+        )
+
+
+def _search(
     query: str,
     limit: int = 10,
     sort: Optional[str] = None,
@@ -516,6 +546,12 @@ def _extract_product(result: dict) -> Optional[dict]:
 
 
 def get_product(product: str) -> dict:
+    """Fetch full product detail for a numeric id or AliExpress URL."""
+    with _gate:
+        return _get_product(product)
+
+
+def _get_product(product: str) -> dict:
     """Fetch full product detail for a numeric id or AliExpress URL."""
     pid = extract_product_id(product)
     if not pid:
