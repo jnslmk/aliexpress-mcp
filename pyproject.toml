@@ -1,6 +1,6 @@
 [project]
 name = "aliexpress-mcp"
-version = "0.1.1"
+version = "0.2.0"
 description = "MCP server for AliExpress product search — self-hosted, no API key"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -19,3 +19,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["aliexpress_mcp"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+# The package is imported from the source tree during tests; no install step.
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -8,16 +8,37 @@ mechanisms (ported from Averyy/fetchaller-mcp, MIT):
   (``/w/wholesale-<slug>.html``) and pull the product list out of the
   ``_init_data_`` JSON blob the page embeds for its own hydration.
 
-* **Product detail** — call AliExpress's internal **MTop** API
-  (``acs.aliexpress.com``). MTop requires a ``_m_h5_tk`` token that the site
-  hands out on the first (deliberately unsigned) request, plus an MD5 request
-  signature ``MD5(token & timestamp & appKey & data)``. We bootstrap the token,
-  sign, and auto-refresh it on expiry.
+* **Product detail** — two paths, tried in order:
 
-Both are fragile by nature — AliExpress can change the embedded-JSON shape, the
-MTop signing scheme, or start returning anti-bot (``x5sec`` / ``RGV587``)
-challenges from datacenter IPs at any time. Every extractor is written
-defensively and failures degrade to a clear error rather than a crash.
+  1. AliExpress's internal **MTop** API (``acs.aliexpress.com``), which returns
+     the rich record (per-variant pricing, store, shipping, specs). MTop needs a
+     ``_m_h5_tk`` token the site hands out on a deliberately unsigned request,
+     plus an MD5 signature ``MD5(token & timestamp & appKey & data)``.
+
+  2. An **SSR composite fallback**, used when MTop is blocked. See
+     ``_get_product_via_ssr``.
+
+  As of 2026-08-08 the MTop product-detail endpoints answer
+  ``FAIL_SYS_USER_VALIDATE / RGV587_ERROR`` for this client and hand back a
+  captcha url instead of data — from a residential IP as readily as from a
+  datacenter one, so it is not the IP-reputation problem it looks like. Two
+  things were verified rather than assumed while establishing that:
+
+  * A *valid* token does not help. ``mtop.relationrecommend...`` still mints a
+    ``_m_h5_tk`` normally (it answers the expected ``FAIL_SYS_TOKEN_EMPTY``),
+    but signing the pdp call with that fresh token is refused just the same —
+    so this is endpoint-level gating, not a token/signing regression.
+  * The product page can no longer stand in for it. ``/item/<id>.html`` is now
+    client-side rendered: ``window.runParams`` ships **empty** and the page
+    fetches its own data from... the same gated MTop endpoint.
+
+  Hence the composite in path 2, which reads only what the page still exposes
+  and recovers the commercial fields from search.
+
+All of this is fragile by nature — AliExpress can change the embedded-JSON
+shape, the MTop signing scheme, or start returning anti-bot (``x5sec`` /
+``RGV587``) challenges at any time. Every extractor is written defensively and
+failures degrade to a clear, partial answer rather than a crash.
 
 TLS fingerprinting via ``curl_cffi`` (Chrome impersonation) is what lets a
 head-less, browser-less container talk to AliExpress without immediately
@@ -37,6 +58,7 @@ import os
 import re
 import threading
 import time
+from html import unescape
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -74,6 +96,23 @@ _MTOP_APIS = [
     ("mtop.aliexpress.pdp.pc.query", "1.0"),
     ("mtop.aliexpress.itemdetail.pc.asyncPCDetail", "1.0"),
 ]
+
+# Token minter. The product-detail endpoints above refuse to mint a token while
+# they are gated (they answer RGV587 instead of the usual FAIL_SYS_TOKEN_EMPTY),
+# which used to leave the client with no token at all and a misleading
+# "bootstrap did not yield a cookie" warning. This endpoint is not gated and
+# still issues one, so token acquisition is decoupled from the API being called.
+_MTOP_TOKEN_MINTER = ("mtop.relationrecommend.aliexpressrecommend.recommend", "1.0")
+
+# How long to stop trying MTop after it answers with an anti-bot challenge.
+# Without this every detail call burns four blocked round-trips (two APIs, each
+# preceded by a token bootstrap) before falling back — slow, and pointless
+# extra traffic to an endpoint that has already said no.
+_MTOP_COOLDOWN = int(os.getenv("AE_MTOP_COOLDOWN", "900"))
+_mtop_blocked_until: float = 0.0
+_mtop_block_lock = threading.Lock()
+
+_OG_SUFFIX_RE = re.compile(r"\s*-\s*AliExpress(?:\s+\d+)?\s*$", re.I)
 
 _PRODUCT_ID_RE = re.compile(r"(?:aliexpress\.com/item/|(?<!\d))(\d{8,20})(?!\d)")
 
@@ -387,13 +426,18 @@ def _bootstrap_token() -> None:
 
     The server answers FAIL_SYS_TOKEN_EMPTY and sets the token cookie, which the
     signed request then uses. Only real API endpoints set the cookie.
+
+    This deliberately asks ``_MTOP_TOKEN_MINTER`` rather than the product-detail
+    API we are about to call: a gated endpoint answers the unsigned bootstrap
+    with RGV587 and sets no cookie at all, so bootstrapping against it fails
+    even when nothing is wrong with tokens.
     """
     global _token, _token_time
     with _token_lock:
         if not _token_expired():
             return
         _token = ""
-        _mtop_get("mtop.aliexpress.pdp.pc.query", "1.0", {})
+        _mtop_get(*_MTOP_TOKEN_MINTER, {})
         if not _token:
             log.warning("MTop token bootstrap did not yield an _m_h5_tk cookie")
 
@@ -551,12 +595,23 @@ def get_product(product: str) -> dict:
         return _get_product(product)
 
 
-def _get_product(product: str) -> dict:
-    """Fetch full product detail for a numeric id or AliExpress URL."""
-    pid = extract_product_id(product)
-    if not pid:
-        raise AliExpressError(f"could not extract a product id from: {product!r}")
+def _mtop_in_cooldown() -> bool:
+    return time.time() < _mtop_blocked_until
 
+
+def _mark_mtop_blocked() -> None:
+    global _mtop_blocked_until
+    with _mtop_block_lock:
+        _mtop_blocked_until = time.time() + _MTOP_COOLDOWN
+
+
+def _get_product_via_mtop(pid: str) -> Optional[dict]:
+    """Rich product record via MTop, or ``None`` if MTop cannot serve it.
+
+    Raises only for a definitive *product-level* answer (not found). An
+    anti-bot refusal returns ``None`` after arming the cooldown, so the caller
+    can fall back instead of failing the whole request.
+    """
     data = {
         "productId": pid,
         "_lang": LOCALE,
@@ -565,15 +620,13 @@ def _get_product(product: str) -> dict:
         "clientType": "pc",
     }
 
-    last_ret = ""
     for api, version in _MTOP_APIS:
         try:
             result = _mtop_request(api, version, data)
         except Exception as exc:  # noqa: BLE001
-            last_ret = str(exc)
+            log.debug("MTop %s transport error: %s", api, exc)
             continue
         ret = _ret_str(result)
-        last_ret = ret
         if "SUCCESS" in ret:
             inner = (result.get("data", {}).get("result", {}) or {})
             gd = (inner.get("GLOBAL_DATA") or {}).get("globalData", {})
@@ -584,12 +637,181 @@ def _get_product(product: str) -> dict:
                 return extracted
             continue
         if "FAIL_SYS_USER_VALIDATE" in ret or "RGV587_ERROR" in ret:
-            raise AliExpressError(
-                "blocked by AliExpress anti-bot (x5sec/RGV587) — MTop rejected the "
-                "signed request. Datacenter IPs are challenged more aggressively."
+            _mark_mtop_blocked()
+            log.info(
+                "MTop product detail is anti-bot gated (%s); using the SSR "
+                "fallback and skipping MTop for %ss",
+                ret.split("::")[0],
+                _MTOP_COOLDOWN,
             )
+            return None
+    return None
 
-    raise AliExpressError(f"could not retrieve product {pid} (last MTop status: {last_ret})")
+
+def _item_page_identity(pid: str) -> dict:
+    """Title, images and canonical url straight off the product page.
+
+    The page is client-side rendered, so this reads the ``og:`` meta tags and
+    the ``_d_c_.DCData`` image list the server still emits — the only product
+    facts left in the HTML. Deliberately not parsed for price: it is not there.
+    """
+    session = _get_session()
+    url = f"https://www.aliexpress.com/item/{pid}.html"
+    try:
+        resp = session.get(url, timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        raise AliExpressError(f"product page request failed: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise AliExpressError(f"product page returned HTTP {resp.status_code}")
+
+    html_text = resp.text
+    if "_____tmd_____" in html_text or "x5secdata" in html_text:
+        raise AliExpressError(
+            "blocked by AliExpress anti-bot — the product page returned a "
+            "verification page instead of the listing."
+        )
+
+    def _meta(prop: str) -> Optional[str]:
+        m = re.search(
+            r'<meta[^>]+property="%s"[^>]+content="([^"]*)"' % re.escape(prop),
+            html_text,
+        )
+        return unescape(m.group(1)) if m else None
+
+    title = _meta("og:title") or ""
+    # og:title carries a " - AliExpress <sellerId>" suffix that is not part of
+    # the listing name and would poison the search query built from it below.
+    title = _OG_SUFFIX_RE.sub("", title).strip()
+    if not title:
+        raise AliExpressError(
+            f"product {pid} not found, or its page no longer exposes a title"
+        )
+
+    images: list[str] = []
+    m = re.search(r"window\._d_c_\.DCData\s*=\s*\{", html_text)
+    if m:
+        blob = _extract_json_object(html_text, m.end() - 1, 200_000) or {}
+        images = [i for i in (blob.get("imagePathList") or []) if i][:12]
+    if not images:
+        main = _meta("og:image")
+        images = [main] if main else []
+
+    return {"title": title, "images": images, "url": url}
+
+
+def _find_in_search(pid: str, title: str) -> Optional[dict]:
+    """Locate this product among search results to recover its commercial data.
+
+    The full listing title is a poor query — AliExpress slugifies it into a very
+    long URL and recall drops — so this tries a trimmed prefix first and only
+    then a shorter one. Two searches maximum: this runs inside the concurrency
+    gate, and the point of the fallback is to be cheap.
+    """
+    words = title.split()
+    queries = [" ".join(words[:12])]
+    if len(words) > 6:
+        queries.append(" ".join(words[:6]))
+
+    for query in queries:
+        try:
+            # _search, never search: we already hold _gate and it is not
+            # reentrant, so calling the public wrapper would deadlock.
+            result = _search(query, limit=40)
+        except AliExpressError as exc:
+            log.debug("fallback search %r failed: %s", query, exc)
+            return None
+        for item in result.get("items") or []:
+            if item.get("id") == pid:
+                return item
+    return None
+
+
+def _get_product_via_ssr(pid: str, mtop_note: str) -> dict:
+    """Compose a product record from the sources that still work.
+
+    Identity (title, images, url) comes from the product page; the commercial
+    fields (price, rating, orders) from finding the same id in search results.
+    Anything MTop alone could supply is reported as unavailable rather than
+    silently omitted, so a caller cannot mistake a partial record for a full one.
+    """
+    identity = _item_page_identity(pid)
+    hit = _find_in_search(pid, identity["title"])
+
+    record: dict[str, Any] = {
+        "id": pid,
+        "title": identity["title"],
+        "url": identity["url"],
+        "images": identity["images"],
+        "source": "ssr+search",
+        "partial": True,
+        "detail_note": mtop_note,
+    }
+
+    if hit:
+        record.update(
+            {
+                "price": {
+                    "sale_price": hit.get("price_formatted"),
+                    "sale_value": hit.get("price"),
+                    "original_price": hit.get("original_price"),
+                    "discount_pct": hit.get("discount_pct"),
+                    "currency": hit.get("currency") or CURRENCY,
+                },
+                "rating": hit.get("rating"),
+                "orders": hit.get("orders"),
+            }
+        )
+        unavailable = ["review_count", "stock", "store", "shipping", "variants",
+                       "variants_pricing", "specs", "category_path"]
+    else:
+        record["price"] = None
+        record["rating"] = None
+        record["orders"] = None
+        record["price_note"] = (
+            "could not match this listing in search results, so price, rating "
+            "and orders are unavailable — only the page's own title and images "
+            "could be read."
+        )
+        unavailable = ["price", "rating", "orders", "review_count", "stock",
+                       "store", "shipping", "variants", "variants_pricing",
+                       "specs", "category_path"]
+
+    record["unavailable"] = unavailable
+    return record
+
+
+def _get_product(product: str) -> dict:
+    """Fetch product detail for a numeric id or AliExpress URL.
+
+    Prefers the rich MTop record and falls back to the SSR composite when MTop
+    is gated. MTop is still attempted first (outside its cooldown) so the full
+    record returns automatically if AliExpress ever ungates it — the fallback is
+    a degradation, not a replacement.
+    """
+    pid = extract_product_id(product)
+    if not pid:
+        raise AliExpressError(f"could not extract a product id from: {product!r}")
+
+    if _mtop_in_cooldown():
+        note = (
+            "MTop product detail was anti-bot gated recently, so it was skipped "
+            "for this call; the record below is composed from the product page "
+            "and search results."
+        )
+    else:
+        mtop_record = _get_product_via_mtop(pid)
+        if mtop_record:
+            mtop_record["source"] = "mtop"
+            mtop_record["partial"] = False
+            return mtop_record
+        note = (
+            "MTop product detail is anti-bot gated (FAIL_SYS_USER_VALIDATE / "
+            "RGV587), so the record below is composed from the product page and "
+            "search results."
+        )
+
+    return _get_product_via_ssr(pid, note)
 
 
 def liveness() -> dict:

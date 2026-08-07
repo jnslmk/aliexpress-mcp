@@ -9,3 +9,4 @@ dist/
 build/
 sample_*.json
 pid.txt
+uv.lock

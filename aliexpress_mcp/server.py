@@ -1,10 +1,11 @@
 """MCP server exposing AliExpress product search — self-hosted, no API key.
 
 There is no official AliExpress product API, so this mirrors the aliexpress.com
-web frontend: server-rendered search pages for ``search_aliexpress`` and the
-site's internal MTop API (token bootstrap + MD5 request signing) for
-``get_aliexpress_product``. See ``aliexpress_client`` for the gory details and
-the fragility caveats.
+web frontend: server-rendered search pages for ``search_aliexpress``, and for
+``get_aliexpress_product`` the site's internal MTop API (token bootstrap + MD5
+request signing) with a composite product-page/search fallback for when MTop is
+anti-bot gated — which it is at the time of writing. See ``aliexpress_client``
+for the gory details and the fragility caveats.
 
 Ported from Averyy/fetchaller-mcp (MIT). Transport, packaging and ``/healthz``
 mirror the sibling ebay-mcp so it runs as a long-lived container behind
@@ -80,15 +81,18 @@ def _coerce_float(
 
 mcp = FastMCP(
     name="aliexpress",
-    version="0.1.1",
+    version="0.2.0",
     instructions=(
         "Search AliExpress and inspect product listings. This is key-less and "
         f"scoped to the {REGION} market, so prices are in {CURRENCY} and titles "
         f"are localised to {LOCALE}. Start with `search_aliexpress` to get a list "
         "of products with their ids and prices, then call "
-        "`get_aliexpress_product` with a product id (or its full URL) for the full "
-        "record: all variants and their prices, rating, images, shipping and the "
-        "store. This is read-only — it searches and reads listings, it cannot buy. "
+        "`get_aliexpress_product` with a product id (or its full URL) for a closer "
+        "look. That tool's answer may be complete or partial depending on what "
+        "AliExpress is currently serving — check its `partial` flag and its "
+        "`unavailable` list, and report a field named there as 'could not be "
+        "retrieved' rather than as absent from the listing. "
+        "This is read-only — it searches and reads listings, it cannot buy. "
         "AliExpress has no public API; results come from its web frontend and can "
         "occasionally be blocked by anti-bot protection."
     ),
@@ -169,14 +173,28 @@ def get_aliexpress_product(
         ),
     ],
 ) -> dict[str, Any]:
-    """Retrieve the full record of one AliExpress product.
+    """Retrieve the record of one AliExpress product.
 
-    Use after `search_aliexpress` surfaces something worth a closer look. Returns
-    title, the selected-variant price plus per-variant pricing, star rating and
-    review count, orders sold, stock, the store (name, positive rating, country),
-    shipping (origin, ship-to, delivery estimate), the SKU option axes
-    (e.g. colour / size), specifications and all product images. Prices are in the
-    configured currency (EUR by default).
+    Use after `search_aliexpress` surfaces something worth a closer look.
+
+    How complete the answer is depends on which source could serve it, so check
+    the `source` and `partial` fields before describing it to the user:
+
+    * `source: "mtop"`, `partial: false` — the full record: title, selected-variant
+      price plus per-variant pricing, star rating and review count, orders sold,
+      stock, the store (name, positive rating, country), shipping (origin,
+      ship-to, delivery estimate), the SKU option axes (e.g. colour / size),
+      specifications and all product images.
+    * `source: "ssr+search"`, `partial: true` — AliExpress is currently gating its
+      detail API behind an anti-bot challenge, so the record is composed from the
+      product page and search results: title, images, url, price, rating and
+      orders. Every field that could not be obtained is named in `unavailable`.
+      Occasionally even price/rating cannot be recovered, and `price_note` says so.
+
+    Prices are in the configured currency (EUR by default). A field listed in
+    `unavailable` is unknown, **not** absent from the listing — do not tell the
+    user a product has no variants, no reviews or no shipping options on that
+    basis; say that detail could not be retrieved.
     """
     try:
         return get_product(product)
