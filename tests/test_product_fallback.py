@@ -280,6 +280,9 @@ def test_get_product_prefers_mtop_when_it_works(monkeypatch):
         ac, "_get_product_via_mtop", lambda pid: {"id": pid, "title": "full record"}
     )
     monkeypatch.setattr(
+        ac, "_get_product_via_browser", lambda pid: pytest.fail("no browser needed")
+    )
+    monkeypatch.setattr(
         ac, "_get_product_via_ssr", lambda *a: pytest.fail("should not fall back")
     )
     rec = ac._get_product(PID)
@@ -287,25 +290,81 @@ def test_get_product_prefers_mtop_when_it_works(monkeypatch):
     assert rec["partial"] is False
 
 
-def test_get_product_falls_back_when_mtop_returns_nothing(monkeypatch):
+def test_get_product_uses_the_browser_when_mtop_is_gated(monkeypatch):
+    """The browser is the real answer to the gate — not the partial composite."""
     monkeypatch.setattr(ac, "_get_product_via_mtop", lambda pid: None)
+    monkeypatch.setattr(
+        ac, "_get_product_via_browser", lambda pid: {"id": pid, "title": "full"}
+    )
+    monkeypatch.setattr(
+        ac, "_get_product_via_ssr", lambda *a: pytest.fail("browser worked; no SSR")
+    )
+    rec = ac._get_product(PID)
+    assert rec["source"] == "browser"
+    assert rec["partial"] is False
+
+
+def test_get_product_falls_back_to_ssr_only_when_the_browser_also_fails(monkeypatch):
+    monkeypatch.setattr(ac, "_get_product_via_mtop", lambda pid: None)
+    monkeypatch.setattr(ac, "_get_product_via_browser", lambda pid: None)
     monkeypatch.setattr(
         ac, "_get_product_via_ssr", lambda pid, note: {"id": pid, "note": note}
     )
-    assert "RGV587" in ac._get_product(PID)["note"]
+    note = ac._get_product(PID)["note"]
+    assert "RGV587" in note
+    assert "browser transport could not retrieve it" in note
 
 
-def test_get_product_skips_mtop_entirely_while_in_cooldown(monkeypatch):
+def test_get_product_still_tries_the_browser_during_mtop_cooldown(monkeypatch):
+    """Cooldown suppresses the cheap HTTP attempt, not the working transport."""
     monkeypatch.setattr(
         ac,
         "_get_product_via_mtop",
         lambda pid: pytest.fail("MTop must be skipped during cooldown"),
     )
     monkeypatch.setattr(
-        ac, "_get_product_via_ssr", lambda pid, note: {"id": pid, "note": note}
+        ac, "_get_product_via_browser", lambda pid: {"id": pid, "title": "full"}
     )
     ac._mark_mtop_blocked()
-    assert "skipped" in ac._get_product(PID)["note"]
+    assert ac._get_product(PID)["source"] == "browser"
+
+
+def test_browser_path_returns_none_when_no_payload(monkeypatch):
+    monkeypatch.setattr(ac.browser, "fetch_pdp_payload", lambda pid: None)
+    assert ac._get_product_via_browser(PID) is None
+
+
+def test_browser_path_parses_the_intercepted_payload(monkeypatch):
+    """The payload is the same schema MTop returned, so the parser is reused."""
+    payload = {
+        "ret": ["SUCCESS::调用成功"],
+        "data": {"result": {
+            "PRODUCT_TITLE": {"text": "Some Product"},
+            "GLOBAL_DATA": {"globalData": {"productId": PID}},
+        }},
+    }
+    monkeypatch.setattr(ac.browser, "fetch_pdp_payload", lambda pid: payload)
+    rec = ac._get_product_via_browser(PID)
+    assert rec["title"] == "Some Product"
+    assert rec["id"] == PID
+
+
+def test_browser_path_reports_a_delisted_product(monkeypatch):
+    payload = {
+        "ret": ["SUCCESS::调用成功"],
+        "data": {"result": {
+            "GLOBAL_DATA": {"globalData": {"errorCode": "SITEM_NOT_EXIST"}}
+        }},
+    }
+    monkeypatch.setattr(ac.browser, "fetch_pdp_payload", lambda pid: payload)
+    with pytest.raises(ac.AliExpressError, match="not found"):
+        ac._get_product_via_browser(PID)
+
+
+def test_browser_transport_is_disabled_by_env(monkeypatch):
+    monkeypatch.setattr(ac.browser, "BROWSER_ENABLED", False)
+    # Must not try to start Chromium when switched off.
+    assert ac.browser.fetch_pdp_payload(PID) is None
 
 
 def test_get_product_rejects_input_with_no_product_id():

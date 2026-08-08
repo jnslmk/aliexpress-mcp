@@ -12,14 +12,16 @@ the aliexpress.com web frontend does:
 - **Product detail** — tries AliExpress's internal **MTop** API
   (`acs.aliexpress.com`) first, which needs an `_m_h5_tk` token (bootstrapped on
   the first request) and an MD5 request signature `MD5(token & timestamp &
-  appKey & data)`. The token is auto-refreshed on expiry. When MTop is anti-bot
-  gated — [as it is today](#product-detail-is-currently-partial) — it falls back
-  to composing the record from the product page and search results.
+  appKey & data)`. MTop is anti-bot gated for plain HTTP clients today, so a
+  headless Chromium loads the product page and the server intercepts the very
+  same MTop response the page fetches for itself. See
+  [how product detail is fetched](#how-product-detail-is-fetched-and-why-a-browser).
 
 TLS fingerprinting via [`curl_cffi`](https://github.com/lexiforest/curl_cffi)
-(Chrome impersonation) lets a head-less, browser-less container talk to
-AliExpress without immediately tripping bot detection — so the image stays tiny
-and runs read-only.
+(Chrome impersonation) is enough for search, which stays a plain HTTP call.
+Product detail additionally needs a real browser (headless Chromium, via
+[`patchright`](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright)) because
+AliExpress gates that endpoint on executed JavaScript, not on TLS fingerprint.
 
 It is **read-only**: it searches and reads listings, it cannot buy.
 
@@ -28,43 +30,56 @@ It is **read-only**: it searches and reads listings, it cannot buy.
 | Tool | Purpose |
 |---|---|
 | `search_aliexpress` | Keyword search with optional `sort` (`orders`, `price_asc`, `price_desc`, `newest`), `min_price` / `max_price`, and `page`. Returns products with `id`, title, price, currency, rating, orders-sold, image and URL. |
-| `get_aliexpress_product` | Record for a numeric product id **or** a full product URL. At best (`source: "mtop"`): title, selected + per-variant prices, rating, review count, orders, stock, store, shipping, SKU option axes, specs and all images. When MTop is gated (`source: "ssr+search"`, `partial: true`): title, images, url, price, rating and orders, with everything else named in `unavailable`. |
+| `get_aliexpress_product` | Full record for a numeric product id **or** a full product URL: title, selected + per-variant prices, rating, review count, orders, stock, store, shipping, SKU option axes, specs and all images. Served via MTop or the browser transport (`source: "mtop"` / `"browser"`, `partial: false`). If both are unavailable it degrades to `source: "ssr+search"`, `partial: true` — title, images, url, price, rating and orders, with everything else named in `unavailable`. |
 
 Responses are shaped as clean dicts (`{query, returned, total, items: [...]}` for
 search). On an anti-bot block or a transport error the tool returns
 `{"error": "..."}` rather than raising.
 
-### Product detail is currently partial
+### How product detail is fetched (and why a browser)
 
 As of **2026-08-08** AliExpress answers the MTop product-detail endpoints
 (`mtop.aliexpress.pdp.pc.query`, `…itemdetail.pc.asyncPCDetail`) with
-`FAIL_SYS_USER_VALIDATE` / `RGV587_ERROR` and a captcha url instead of data.
-Two things were checked rather than assumed:
+`FAIL_SYS_USER_VALIDATE` / `RGV587_ERROR` and a captcha url instead of data,
+when called over plain HTTP. Four things were checked rather than assumed:
 
-- **It is not an IP-reputation problem.** A residential IP is refused exactly
-  like a datacenter one, in the same minute.
-- **It is not a token or signing regression.**
+- **Not an IP-reputation problem.** A residential IP is refused exactly like a
+  datacenter one, in the same minute.
+- **Not a token or signing regression.**
   `mtop.relationrecommend.aliexpressrecommend.recommend` still mints an
   `_m_h5_tk` normally, and signing the pdp call with that fresh token is
-  refused just the same. The gate is on the endpoint.
+  refused just the same.
+- **Not login-gated, and the endpoint is not dead.** A real Chromium — *not*
+  logged in, on the *same IP*, and headless at that — gets `SUCCESS` and a
+  ~95 KB payload from that exact endpoint. What the anti-bot wants is the
+  JavaScript executed; `curl_cffi`'s Chrome TLS impersonation is not enough on
+  its own.
+- **The product page cannot stand in for it.** `/item/<id>.html` is now
+  client-side rendered, ships an empty `window.runParams`, and fetches its own
+  data from that same endpoint.
 
-The obvious workaround — read the product page instead — does not work either:
-`/item/<id>.html` is now client-side rendered, ships an empty
-`window.runParams`, and fetches its own data from that same gated endpoint.
+So detail uses three transports, cheapest first:
 
-So `get_aliexpress_product` composes what it still can:
+| # | Transport | Result |
+|---|---|---|
+| 1 | Direct MTop over HTTP | Currently gated. Still tried first, so the cheap path resumes automatically if AliExpress ungates it |
+| 2 | **Browser** — load the page, intercept its own `pdp.pc.query` response | **Full record.** ~2 s warm. `source: "browser"` |
+| 3 | SSR composite — product page + search results | Partial. Only if the browser is disabled or fails. `source: "ssr+search"`, `partial: true` |
 
-| Field | Source |
-|---|---|
-| title, images, url | `og:` meta tags + `_d_c_.DCData` on the product page |
-| price, rating, orders | the product's own entry in search results, matched by id |
-| variants, specs, store, shipping, stock, review count | **unavailable** — listed in `unavailable` |
+Transport 2 does not reimplement the anti-bot JavaScript; it just reads the
+answer the page already obtains for itself. The payload is byte-identical to
+what direct MTop used to return, so the same parser handles it unchanged.
 
-MTop is still attempted first on every call (outside a cooldown after a block),
-so the full record comes back automatically if AliExpress ever ungates it. The
-fallback is a degradation, not a replacement — and `partial`/`unavailable` exist
-so a model cannot mistake one for the other and tell a user a product "has no
-reviews" when the field simply could not be read.
+Two behaviours here were measured, not guessed, and both are counter-intuitive:
+
+- **A fresh browser context per lookup, not a warm one.** Reusing a context got
+  the *second* back-to-back lookup answered with RGV587, while the first request
+  of a fresh context succeeds. Carried-over state is what marks you.
+- **Bail out the instant RGV587 arrives.** The page will not retry itself, so
+  waiting out the timeout buys nothing — detecting it and retrying in a fresh
+  context turns a 45 s dead wait into a ~2 s retry. AliExpress challenges a
+  *proportion* of loads rather than locking on, so a capped retry
+  (`AE_BROWSER_ATTEMPTS`, default 3) recovers almost all of them.
 
 ## Market (Germany / EUR by default)
 
@@ -78,6 +93,11 @@ vars (defaults in **bold**):
 | `AE_LOCALE` | **`de_DE`** | Language / localisation |
 | `AE_MAX_CONCURRENT` | **`2`** | Process-wide cap on concurrent requests to AliExpress (0.1.1+). Chat agents fire several tool calls in parallel; the excess queue instead of hitting AliExpress at once, which is what trips its anti-bot (x5sec / TMD). |
 | `AE_MTOP_COOLDOWN` | **`900`** | Seconds to stop attempting MTop product detail after it answers with an anti-bot challenge (0.2.0+). Without it every detail call burns four blocked round-trips before falling back. Set `0` to retry MTop on every call. |
+| `AE_BROWSER_ENABLED` | **`true`** | Browser transport for product detail (0.3.0+). Set `false` to run browser-less; detail then degrades to the partial `ssr+search` record. |
+| `AE_BROWSER_ATTEMPTS` | **`3`** | Attempts per lookup, each in a fresh context. AliExpress challenges a proportion of loads; a retry usually clears it. |
+| `AE_BROWSER_RETRY_DELAY_S` | **`1.5`** | Pause between attempts. Retrying instantly is what the anti-bot watches for. |
+| `AE_BROWSER_TIMEOUT_MS` | **`45000`** | Per-attempt budget. Rarely reached: a challenged attempt aborts as soon as RGV587 arrives. |
+| `AE_BROWSER_HEADLESS` | **`true`** | Headless suffices for AliExpress (verified). Unlike the sibling baumarkt-mcp, no Xvfb/headed display is needed. |
 
 These are pushed to AliExpress via the `aep_usuc_f` cookie (search) and the
 `_lang` / `_currency` / `country` MTop params (product detail). Any market the
@@ -108,10 +128,12 @@ problem (there is no official API), but it means:
   time and break extraction. Every extractor is written defensively and failures
   degrade to a clear error.
 - **Datacenter IPs are challenged more aggressively than residential ones.** From
-  some hosts AliExpress may return an anti-bot (`x5sec` / `RGV587` / TMD punish)
-  response and the tool will report a block. There is no browser fallback in this
-  build (kept deliberately browser-less); if your host is hard-blocked, run it
-  from a residential connection.
+  some hosts AliExpress returns an anti-bot (`x5sec` / `RGV587` / TMD punish)
+  response to *search* and the tool reports a block. Search has no browser
+  fallback — it is a plain HTTP call by design — so if your host is hard-blocked,
+  run it from a residential connection. (Product detail is different: it is
+  gated for every plain-HTTP client regardless of IP, which is why it uses the
+  browser transport.)
 - **A residential IP is not immunity — volume still trips the block.** While
   developing 0.2.0 a burst of exploratory requests earned a TMD punish page on a
   residential connection that lasted well over an hour, taking `search` down with

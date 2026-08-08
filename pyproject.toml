@@ -1,6 +1,6 @@
 [project]
 name = "aliexpress-mcp"
-version = "0.2.1"
+version = "0.3.0"
 description = "MCP server for AliExpress product search — self-hosted, no API key"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,6 +8,10 @@ license = { text = "MIT" }
 dependencies = [
     "fastmcp>=3.4.4",
     "curl_cffi>=0.7.0",
+    # Browser transport for product detail (see browser.py). patchright is a
+    # drop-in Playwright fork with anti-detection patches, same choice as the
+    # sibling baumarkt-mcp.
+    "patchright>=1.49",
 ]
 
 [project.scripts]

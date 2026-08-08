@@ -8,32 +8,39 @@ mechanisms (ported from Averyy/fetchaller-mcp, MIT):
   (``/w/wholesale-<slug>.html``) and pull the product list out of the
   ``_init_data_`` JSON blob the page embeds for its own hydration.
 
-* **Product detail** — two paths, tried in order:
+* **Product detail** — three transports, cheapest first:
 
   1. AliExpress's internal **MTop** API (``acs.aliexpress.com``), which returns
      the rich record (per-variant pricing, store, shipping, specs). MTop needs a
      ``_m_h5_tk`` token the site hands out on a deliberately unsigned request,
      plus an MD5 signature ``MD5(token & timestamp & appKey & data)``.
 
-  2. An **SSR composite fallback**, used when MTop is blocked. See
+  2. A **browser** that loads the product page and hands back the very same
+     MTop response the page fetches for itself. See ``browser.py``.
+
+  3. An **SSR composite fallback** for when the browser is unavailable. See
      ``_get_product_via_ssr``.
 
-  As of 2026-08-08 the MTop product-detail endpoints answer
-  ``FAIL_SYS_USER_VALIDATE / RGV587_ERROR`` for this client and hand back a
-  captcha url instead of data — from a residential IP as readily as from a
-  datacenter one, so it is not the IP-reputation problem it looks like. Two
-  things were verified rather than assumed while establishing that:
+  As of 2026-08-08 path 1 answers ``FAIL_SYS_USER_VALIDATE / RGV587_ERROR``
+  with a captcha url instead of data. Four things were verified rather than
+  assumed while pinning that down:
 
-  * A *valid* token does not help. ``mtop.relationrecommend...`` still mints a
-    ``_m_h5_tk`` normally (it answers the expected ``FAIL_SYS_TOKEN_EMPTY``),
-    but signing the pdp call with that fresh token is refused just the same —
-    so this is endpoint-level gating, not a token/signing regression.
-  * The product page can no longer stand in for it. ``/item/<id>.html`` is now
+  * **Not IP reputation.** A residential IP is refused in the same minute as a
+    datacenter one.
+  * **Not a token/signing regression.** ``mtop.relationrecommend...`` still
+    mints a ``_m_h5_tk`` normally, and signing the pdp call with that fresh
+    token is refused just the same.
+  * **Not login-gated, and not the endpoint being dead.** A real Chromium, not
+    logged in, on the *same IP*, gets ``SUCCESS`` and a ~95 KB payload from that
+    exact endpoint. What the anti-bot wants is the JavaScript executed —
+    ``curl_cffi``'s Chrome TLS impersonation is not enough on its own.
+  * **The product page cannot stand in for it.** ``/item/<id>.html`` is now
     client-side rendered: ``window.runParams`` ships **empty** and the page
-    fetches its own data from... the same gated MTop endpoint.
+    fetches its own data from that same MTop endpoint.
 
-  Hence the composite in path 2, which reads only what the page still exposes
-  and recovers the commercial fields from search.
+  Hence path 2, which is not a reimplementation of the anti-bot JS but simply
+  a reader of the answer the page already obtains. The payload is identical, so
+  ``_extract_product`` parses it unchanged.
 
 All of this is fragile by nature — AliExpress can change the embedded-JSON
 shape, the MTop signing scheme, or start returning anti-bot (``x5sec`` /
@@ -63,6 +70,8 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from curl_cffi import requests
+
+from aliexpress_mcp import browser
 
 log = logging.getLogger("aliexpress-mcp")
 
@@ -800,13 +809,42 @@ def _get_product_via_ssr(pid: str, mtop_note: str) -> dict:
     return record
 
 
+def _get_product_via_browser(pid: str) -> Optional[dict]:
+    """Full record via a real browser, or ``None`` if it could not be had.
+
+    The browser loads the product page and we intercept the very same
+    ``pdp.pc.query`` response the page fetches for itself, so the payload is
+    byte-identical to what direct MTop returned before it was gated — and
+    ``_extract_product`` parses it unchanged.
+    """
+    payload = browser.fetch_pdp_payload(pid)
+    if not payload:
+        return None
+
+    inner = (payload.get("data", {}).get("result", {}) or {})
+    gd = (inner.get("GLOBAL_DATA") or {}).get("globalData", {})
+    if gd.get("errorCode") == "SITEM_NOT_EXIST":
+        raise AliExpressError(f"product {pid} not found (delisted or unavailable)")
+
+    record = _extract_product(payload)
+    if record and record.get("title"):
+        return record
+    log.info("browser returned a pdp payload for %s but it had no title", pid)
+    return None
+
+
 def _get_product(product: str) -> dict:
     """Fetch product detail for a numeric id or AliExpress URL.
 
-    Prefers the rich MTop record and falls back to the SSR composite when MTop
-    is gated. MTop is still attempted first (outside its cooldown) so the full
-    record returns automatically if AliExpress ever ungates it — the fallback is
-    a degradation, not a replacement.
+    Three transports, cheapest first:
+
+    1. **Direct MTop** — one signed HTTP call. Currently anti-bot gated, but
+       still tried (outside its cooldown) so the full record comes back
+       automatically the day AliExpress ungates it.
+    2. **Browser** — drives the page and intercepts its own MTop response.
+       Same full record; costs a page load, so it is not the first choice.
+    3. **SSR composite** — product page + search. Partial, and only a last
+       resort for when the browser is disabled or cannot run.
     """
     pid = extract_product_id(product)
     if not pid:
@@ -815,8 +853,7 @@ def _get_product(product: str) -> dict:
     if _mtop_in_cooldown():
         note = (
             "MTop product detail was anti-bot gated recently, so it was skipped "
-            "for this call; the record below is composed from the product page "
-            "and search results."
+            "for this call."
         )
     else:
         mtop_record = _get_product_via_mtop(pid)
@@ -826,11 +863,20 @@ def _get_product(product: str) -> dict:
             return mtop_record
         note = (
             "MTop product detail is anti-bot gated (FAIL_SYS_USER_VALIDATE / "
-            "RGV587), so the record below is composed from the product page and "
-            "search results."
+            "RGV587)."
         )
 
-    return _get_product_via_ssr(pid, note)
+    browser_record = _get_product_via_browser(pid)
+    if browser_record:
+        browser_record["source"] = "browser"
+        browser_record["partial"] = False
+        return browser_record
+
+    return _get_product_via_ssr(
+        pid,
+        note + " The browser transport could not retrieve it either, so the "
+        "record below is composed from the product page and search results.",
+    )
 
 
 def liveness() -> dict:
