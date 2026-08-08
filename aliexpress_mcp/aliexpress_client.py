@@ -700,8 +700,14 @@ def _item_page_identity(pid: str) -> dict:
     return {"title": title, "images": images, "url": url}
 
 
-def _find_in_search(pid: str, title: str) -> Optional[dict]:
+def _find_in_search(pid: str, title: str) -> tuple[Optional[dict], str]:
     """Locate this product among search results to recover its commercial data.
+
+    Returns ``(hit, status)`` where status is ``matched``, ``not_found`` or
+    ``blocked``. The distinction is not cosmetic: "we searched and this listing
+    was not in the results" and "we never got to search" need different fixes,
+    and collapsing them into one empty answer is how a transient block gets
+    misread as a parser regression.
 
     The full listing title is a poor query — AliExpress slugifies it into a very
     long URL and recall drops — so this tries a trimmed prefix first and only
@@ -719,12 +725,15 @@ def _find_in_search(pid: str, title: str) -> Optional[dict]:
             # reentrant, so calling the public wrapper would deadlock.
             result = _search(query, limit=40)
         except AliExpressError as exc:
-            log.debug("fallback search %r failed: %s", query, exc)
-            return None
+            # Logged at INFO, not debug: without it an operator sees a record
+            # missing its price and no reason anywhere for why.
+            log.info("product-detail fallback search was blocked (%r): %s", query, exc)
+            return None, "blocked"
         for item in result.get("items") or []:
             if item.get("id") == pid:
-                return item
-    return None
+                return item, "matched"
+    log.info("product-detail fallback searched but did not find %s in results", pid)
+    return None, "not_found"
 
 
 def _get_product_via_ssr(pid: str, mtop_note: str) -> dict:
@@ -736,7 +745,7 @@ def _get_product_via_ssr(pid: str, mtop_note: str) -> dict:
     silently omitted, so a caller cannot mistake a partial record for a full one.
     """
     identity = _item_page_identity(pid)
-    hit = _find_in_search(pid, identity["title"])
+    hit, search_status = _find_in_search(pid, identity["title"])
 
     record: dict[str, Any] = {
         "id": pid,
@@ -768,11 +777,21 @@ def _get_product_via_ssr(pid: str, mtop_note: str) -> dict:
         record["price"] = None
         record["rating"] = None
         record["orders"] = None
-        record["price_note"] = (
-            "could not match this listing in search results, so price, rating "
-            "and orders are unavailable — only the page's own title and images "
-            "could be read."
-        )
+        if search_status == "blocked":
+            record["price_note"] = (
+                "AliExpress is currently rate-limiting/anti-bot blocking the "
+                "search page, which is where this fallback reads price, rating "
+                "and orders — so those are unknown for now. This is transient: "
+                "the same lookup usually succeeds once the block lifts. Only "
+                "the product page's own title and images could be read."
+            )
+        else:
+            record["price_note"] = (
+                "searched, but this listing did not appear in the results, so "
+                "price, rating and orders are unavailable — only the product "
+                "page's own title and images could be read."
+            )
+        record["search_status"] = search_status
         unavailable = ["price", "rating", "orders", "review_count", "stock",
                        "store", "shipping", "variants", "variants_pricing",
                        "specs", "category_path"]

@@ -150,7 +150,9 @@ def test_find_in_search_matches_on_id_not_position(monkeypatch):
     monkeypatch.setattr(
         ac, "_search", lambda q, limit: {"items": [other, SEARCH_HIT]}
     )
-    assert ac._find_in_search(PID, "some title")["id"] == PID
+    hit, status = ac._find_in_search(PID, "some title")
+    assert hit["id"] == PID
+    assert status == "matched"
 
 
 def test_find_in_search_retries_with_a_shorter_query(monkeypatch):
@@ -162,18 +164,40 @@ def test_find_in_search_retries_with_a_shorter_query(monkeypatch):
 
     monkeypatch.setattr(ac, "_search", fake_search)
     title = " ".join(f"w{i}" for i in range(20))
-    assert ac._find_in_search(PID, title)["id"] == PID
+    assert ac._find_in_search(PID, title)[0]["id"] == PID
     # 12-word prefix first, then a 6-word one — and never the full 20 words.
     assert [len(q.split()) for q in seen] == [12, 6]
 
 
-def test_find_in_search_gives_up_quietly_when_search_is_blocked(monkeypatch):
+def test_find_in_search_reports_blocked_separately_from_not_found(monkeypatch):
+    """The two must stay distinguishable — they need different responses."""
     def blocked(query, limit):  # noqa: ANN001
         raise ac.AliExpressError("blocked by AliExpress anti-bot (TMD challenge)")
 
     monkeypatch.setattr(ac, "_search", blocked)
-    # A blocked search must degrade the record, not abort the whole call.
-    assert ac._find_in_search(PID, "a title") is None
+    hit, status = ac._find_in_search(PID, "a title")
+    # A blocked search must degrade the record, not abort the whole call...
+    assert hit is None
+    # ...and must not be reported as "this listing isn't in the results".
+    assert status == "blocked"
+
+
+def test_find_in_search_stops_after_the_first_block(monkeypatch):
+    """A blocked search means blocked; retrying just adds load during a punish."""
+    calls: list[str] = []
+
+    def blocked(query, limit):  # noqa: ANN001
+        calls.append(query)
+        raise ac.AliExpressError("blocked by AliExpress anti-bot (TMD challenge)")
+
+    monkeypatch.setattr(ac, "_search", blocked)
+    ac._find_in_search(PID, " ".join(f"w{i}" for i in range(20)))
+    assert len(calls) == 1
+
+
+def test_find_in_search_reports_not_found_when_search_worked(monkeypatch):
+    monkeypatch.setattr(ac, "_search", lambda q, limit: {"items": []})
+    assert ac._find_in_search(PID, "a title") == (None, "not_found")
 
 
 def test_find_in_search_never_calls_the_gated_public_wrapper(monkeypatch):
@@ -182,7 +206,7 @@ def test_find_in_search_never_calls_the_gated_public_wrapper(monkeypatch):
     monkeypatch.setattr(
         ac, "search", lambda *a, **k: pytest.fail("must not call gated search()")
     )
-    assert ac._find_in_search(PID, "title")["id"] == PID
+    assert ac._find_in_search(PID, "title")[0]["id"] == PID
 
 
 # --------------------------------------------------------------------------- #
@@ -218,11 +242,32 @@ def test_ssr_record_without_a_search_match_says_so_explicitly(item_page, monkeyp
 
     assert rec["price"] is None
     assert "price_note" in rec
+    assert rec["search_status"] == "not_found"
+    assert "did not appear in the results" in rec["price_note"]
     assert "price" in rec["unavailable"]
     assert "rating" in rec["unavailable"]
     # Identity still came through, so the answer is not useless.
     assert rec["title"].startswith("Original Xiaomi")
     assert rec["images"]
+
+
+def test_ssr_record_says_blocked_rather_than_not_found(item_page, monkeypatch):
+    """A punish page must not be reported as 'this listing wasn't in results'.
+
+    That wording sends the reader hunting for a matching bug that isn't there —
+    the same class of misleading diagnostic as the old "token bootstrap did not
+    yield a cookie", which pointed at tokens when the endpoint was gated.
+    """
+    def blocked(query, limit):  # noqa: ANN001
+        raise ac.AliExpressError("blocked by AliExpress anti-bot (TMD challenge)")
+
+    monkeypatch.setattr(ac, "_search", blocked)
+    rec = ac._get_product_via_ssr(PID, "note")
+
+    assert rec["search_status"] == "blocked"
+    assert "blocking the search page" in rec["price_note"]
+    assert "transient" in rec["price_note"]
+    assert "did not appear in the results" not in rec["price_note"]
 
 
 # --------------------------------------------------------------------------- #

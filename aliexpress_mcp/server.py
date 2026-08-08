@@ -81,7 +81,7 @@ def _coerce_float(
 
 mcp = FastMCP(
     name="aliexpress",
-    version="0.2.0",
+    version="0.2.1",
     instructions=(
         "Search AliExpress and inspect product listings. This is key-less and "
         f"scoped to the {REGION} market, so prices are in {CURRENCY} and titles "
@@ -189,7 +189,11 @@ def get_aliexpress_product(
       detail API behind an anti-bot challenge, so the record is composed from the
       product page and search results: title, images, url, price, rating and
       orders. Every field that could not be obtained is named in `unavailable`.
-      Occasionally even price/rating cannot be recovered, and `price_note` says so.
+      Occasionally even price/rating cannot be recovered; `price_note` explains
+      why and `search_status` distinguishes the two causes — `blocked` (AliExpress
+      is rate-limiting right now, so it is worth retrying later) from `not_found`
+      (the listing genuinely did not turn up in search). Say which one it was
+      rather than just "no price available".
 
     Prices are in the configured currency (EUR by default). A field listed in
     `unavailable` is unknown, **not** absent from the listing — do not tell the
