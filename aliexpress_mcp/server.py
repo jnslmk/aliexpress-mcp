@@ -79,9 +79,38 @@ def _coerce_float(
     return result
 
 
+def _resolve_limit(limit: str | int | None, max_results: str | int | None) -> int:
+    """Accept either name for the result-cap knob on `search_aliexpress`.
+
+    Across the sibling MCP servers this knob has two names — `max_results` in
+    geizhals-mcp and baumarkt-mcp, `limit` here (and in ebay-mcp, amazon-mcp) —
+    and one LLM sees all of them in a single conversation. FastMCP emits
+    ``additionalProperties: false``, so a model that carries the wrong tool's
+    name over gets a hard schema rejection, and the MCP client's error names no
+    field, so the model cannot see what to fix and can only guess. `limit`
+    stays canonical here (renaming it would just churn every existing caller),
+    but `max_results` is accepted too, for the same reason kleinanzeigen-mcp's
+    `_resolve_page_count` accepts both `page_count` and `max_pages`.
+    """
+    if limit is not None and max_results is not None:
+        resolved = _coerce_int(limit, "limit", ge=1)
+        alias = _coerce_int(max_results, "max_results", ge=1)
+        if resolved != alias:
+            raise ValueError(
+                "limit and max_results are two names for the same parameter "
+                f"but were given different values ({resolved} and {alias}); "
+                "pass limit only"
+            )
+    elif max_results is not None:
+        resolved = _coerce_int(max_results, "max_results", ge=1)
+    else:
+        resolved = _coerce_int(limit, "limit", ge=1)
+    return min(resolved or 10, 60)
+
+
 mcp = FastMCP(
     name="aliexpress",
-    version="0.2.1",
+    version="0.3.1",
     instructions=(
         "Search AliExpress and inspect product listings. This is key-less and "
         f"scoped to the {REGION} market, so prices are in {CURRENCY} and titles "
@@ -111,8 +140,9 @@ def search_aliexpress(
         Field(description="Search keywords, e.g. 'usb c kabel' or 'anker powerbank'"),
     ],
     limit: Annotated[
-        str | int, Field(description="Maximum results to return (one page holds ~60)")
-    ] = 10,
+        str | int | None,
+        Field(description="Maximum results to return (one page holds ~60)"),
+    ] = None,
     sort: Annotated[
         Optional[str],
         Field(
@@ -134,6 +164,10 @@ def search_aliexpress(
     page: Annotated[
         str | int, Field(description="Result page (1-indexed), ~60 items per page.")
     ] = 1,
+    max_results: Annotated[
+        str | int | None,
+        Field(description="Deprecated alias for `limit`; prefer `limit`."),
+    ] = None,
 ) -> dict[str, Any]:
     """Search AliExpress product listings by keyword.
 
@@ -142,7 +176,7 @@ def search_aliexpress(
     Prices and titles follow the configured market (Germany / EUR by default).
     Pass a product's `id` to `get_aliexpress_product` for full details.
     """
-    limit = min(_coerce_int(limit, "limit", ge=1) or 10, 60)
+    limit = _resolve_limit(limit, max_results)
     page = _coerce_int(page, "page", ge=1) or 1
     min_price = _coerce_float(min_price, "min_price", ge=0)
     max_price = _coerce_float(max_price, "max_price", ge=0)
