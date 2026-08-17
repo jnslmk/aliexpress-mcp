@@ -8,7 +8,8 @@
       "extra-files": [
         "aliexpress_mcp/server.py"
       ],
-      "last-release-sha": "a33b9a38f04cc43ccc4eb4344f6c7470a20b8e92"
+      "last-release-sha": "a33b9a38f04cc43ccc4eb4344f6c7470a20b8e92",
+      "include-component-in-tag": false
     }
   }
 }
