@@ -110,7 +110,7 @@ def _resolve_limit(limit: str | int | None, max_results: str | int | None) -> in
 
 mcp = FastMCP(
     name="aliexpress",
-    version="0.3.1",  # x-release-please-version
+    version="0.3.2",  # x-release-please-version
     instructions=(
         "Search AliExpress and inspect product listings. This is key-less and "
         f"scoped to the {REGION} market, so prices are in {CURRENCY} and titles "
