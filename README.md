@@ -8,7 +8,9 @@ the aliexpress.com web frontend does:
 
 - **Search** — fetches the server-rendered search page
   (`/w/wholesale-<query>.html`) and pulls the product list out of the
-  `_init_data_` JSON the page embeds for its own hydration.
+  `_init_data_` JSON the page embeds for its own hydration. On an anti-bot
+  (TMD) punish page it falls back to loading the same URL in a headless
+  browser.
 - **Product detail** — tries AliExpress's internal **MTop** API
   (`acs.aliexpress.com`) first, which needs an `_m_h5_tk` token (bootstrapped on
   the first request) and an MD5 request signature `MD5(token & timestamp &
@@ -18,10 +20,12 @@ the aliexpress.com web frontend does:
   [how product detail is fetched](#how-product-detail-is-fetched-and-why-a-browser).
 
 TLS fingerprinting via [`curl_cffi`](https://github.com/lexiforest/curl_cffi)
-(Chrome impersonation) is enough for search, which stays a plain HTTP call.
-Product detail additionally needs a real browser (headless Chromium, via
-[`patchright`](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright)) because
-AliExpress gates that endpoint on executed JavaScript, not on TLS fingerprint.
+(Chrome impersonation) is usually enough for search, which tries a plain HTTP
+call first. Product detail is gated on executed JavaScript rather than TLS
+fingerprint, so it needs a real browser (headless Chromium, via
+[`patchright`](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright)); search
+falls back to the same browser transport when its plain HTTP call is
+anti-bot challenged.
 
 It is **read-only**: it searches and reads listings, it cannot buy.
 
@@ -129,11 +133,11 @@ problem (there is no official API), but it means:
   degrade to a clear error.
 - **Datacenter IPs are challenged more aggressively than residential ones.** From
   some hosts AliExpress returns an anti-bot (`x5sec` / `RGV587` / TMD punish)
-  response to *search* and the tool reports a block. Search has no browser
-  fallback — it is a plain HTTP call by design — so if your host is hard-blocked,
-  run it from a residential connection. (Product detail is different: it is
-  gated for every plain-HTTP client regardless of IP, which is why it uses the
-  browser transport.)
+  response to *search*. Search tries the same cheap plain-HTTP call first and,
+  on a TMD punish page, falls back to the browser transport loading the
+  identical search URL — the same trade AliExpress applies to product detail.
+  If the browser gets challenged too, or `AE_BROWSER_ENABLED=false`, the tool
+  reports a block.
 - **A residential IP is not immunity — volume still trips the block.** While
   developing 0.2.0 a burst of exploratory requests earned a TMD punish page on a
   residential connection that lasted well over an hour, taking `search` down with

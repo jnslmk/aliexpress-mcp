@@ -1,17 +1,24 @@
-"""Browser transport for product detail.
+"""Browser transport for product detail and search.
 
 AliExpress gates the MTop product-detail endpoints against *non-browser*
 clients: `curl_cffi` with Chrome TLS impersonation gets
 ``FAIL_SYS_USER_VALIDATE / RGV587_ERROR`` and a captcha url, while a real
 Chromium on the *same IP*, not logged in, gets ``SUCCESS`` and a ~95 KB
 payload. TLS impersonation is not enough — the anti-bot wants the JavaScript
-executed.
+executed. The SSR search page is gated the same way under load: a plain HTTP
+client gets a ``_____tmd_____`` punish page in place of the embedded
+``_init_data_`` JSON, while a real browser clears the same challenge.
 
 So rather than reimplement that JS, this drives the page and reads the answer
-it fetches for itself: load ``/item/<id>.html``, intercept the
-``mtop.aliexpress.pdp.pc.query`` XHR, hand the JSON to the existing
-``_extract_product``. That parser is unchanged from the direct-MTop days —
-same endpoint, same schema, different transport.
+it fetches for itself:
+
+* **Product detail** — load ``/item/<id>.html``, intercept the
+  ``mtop.aliexpress.pdp.pc.query`` XHR, hand the JSON to the existing
+  ``_extract_product``. That parser is unchanged from the direct-MTop days —
+  same endpoint, same schema, different transport.
+* **Search** — load the same SSR search URL the plain HTTP path would have
+  fetched and return its rendered HTML; ``_extract_init_data`` parses it
+  unchanged, since it is the same server-rendered page either way.
 
 Two hard constraints shape the design:
 
@@ -206,33 +213,33 @@ def _fetch(pid: str) -> Optional[dict]:
                 pass
 
 
-def _fetch_guarded(pid: str) -> Optional[dict]:
-    """Attempt the lookup, retrying a challenged page in a fresh context.
+def _run_guarded(label: str, load: Any) -> Optional[Any]:
+    """Retry ``load()`` in a fresh context on failure. Worker thread only.
 
     AliExpress challenges a *proportion* of page loads rather than locking on:
-    an attempt that gets RGV587 is routinely followed by one that succeeds in
-    ~2s. Retrying is therefore worth far more than it costs — but it is capped,
-    because hammering a site that just said no is how the whole IP gets a
-    multi-hour punish.
+    an attempt that gets RGV587 (or a search punish page) is routinely
+    followed by one that succeeds in ~2s. Retrying is therefore worth far more
+    than it costs — but it is capped, because hammering a site that just said
+    no is how the whole IP gets a multi-hour punish.
     """
     last_exc: Optional[Exception] = None
     for attempt in range(1, BROWSER_ATTEMPTS + 1):
         try:
-            payload = _fetch(pid)
-            if payload:
+            result = load()
+            if result:
                 if attempt > 1:
-                    log.info("browser lookup for %s succeeded on attempt %s", pid, attempt)
-                return payload
+                    log.info("%s succeeded on attempt %s", label, attempt)
+                return result
         except Exception as exc:  # noqa: BLE001 - a bad page must not wedge the browser
             last_exc = exc
-            log.info("browser lookup for %s errored (%s); restarting browser", pid, exc)
+            log.info("%s errored (%s); restarting browser", label, exc)
             _teardown()
         if attempt < BROWSER_ATTEMPTS:
             # A short, deliberate pause: retrying instantly is what the anti-bot
             # is watching for.
             time.sleep(BROWSER_RETRY_DELAY_S)
     if last_exc is None:
-        log.info("browser lookup for %s gave up after %s attempts", pid, BROWSER_ATTEMPTS)
+        log.info("%s gave up after %s attempts", label, BROWSER_ATTEMPTS)
     return None
 
 
@@ -245,7 +252,47 @@ def fetch_pdp_payload(pid: str) -> Optional[dict]:
     if not BROWSER_ENABLED:
         return None
     with _state_lock:
-        future = _executor.submit(_fetch_guarded, pid)
+        future = _executor.submit(_run_guarded, f"browser lookup for {pid}", lambda: _fetch(pid))
+    return future.result(timeout=(BROWSER_TIMEOUT_MS / 1000.0) + 60)
+
+
+_TMD_MARKERS = ("_____tmd_____", "x5secdata")
+
+
+def _fetch_search(url: str) -> Optional[str]:
+    """Load the SSR search page and return its HTML, or ``None`` if challenged.
+
+    Worker thread only. Unlike product detail, nothing needs intercepting:
+    the search page is server-rendered, so the HTML the navigation itself
+    receives already contains (or, when challenged, withholds) the
+    ``_init_data_`` blob ``_extract_init_data`` parses.
+    """
+    ctx = _context(_ensure())
+    page = ctx.new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT_MS)
+        html = page.content()
+        if any(marker in html for marker in _TMD_MARKERS):
+            return None
+        return html
+    finally:
+        for obj in (page, ctx):
+            try:
+                obj.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def fetch_search_html(url: str) -> Optional[str]:
+    """Return the SSR search page's HTML via a real browser, or ``None``.
+
+    Thread-safe entry point: hops onto the dedicated worker and serialises
+    callers behind it.
+    """
+    if not BROWSER_ENABLED:
+        return None
+    with _state_lock:
+        future = _executor.submit(_run_guarded, f"browser search load for {url}", lambda: _fetch_search(url))
     return future.result(timeout=(BROWSER_TIMEOUT_MS / 1000.0) + 60)
 
 

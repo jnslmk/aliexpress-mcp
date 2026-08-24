@@ -67,7 +67,7 @@ import threading
 import time
 from html import unescape
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from curl_cffi import requests
 
@@ -337,11 +337,22 @@ def _search(
 
     html = resp.text
     init_data = _extract_init_data(html)
+    blocked = init_data is None and ("_____tmd_____" in html or "punish" in html.lower())
+
+    if blocked:
+        # The plain HTTP call was anti-bot gated, same as product detail's
+        # MTop path — fall back to a real browser loading the very same URL.
+        full_url = f"{url}?{urlencode(params)}" if params else url
+        browser_html = browser.fetch_search_html(full_url)
+        if browser_html:
+            init_data = _extract_init_data(browser_html)
+
     if not init_data:
-        if "_____tmd_____" in html or "punish" in html.lower():
+        if blocked:
             raise AliExpressError(
                 "blocked by AliExpress anti-bot (TMD challenge) — the search page "
-                "returned a punish/verification page instead of results."
+                "returned a punish/verification page instead of results, and the "
+                "browser fallback could not clear it either."
             )
         raise AliExpressError(
             "could not locate product data in the search page "
