@@ -219,7 +219,6 @@ def _backoff_sleep(attempt: int, retry_after: Optional[float] = None) -> None:
     time.sleep(_backoff_delay(attempt, retry_after))
 
 
-
 # --------------------------------------------------------------------------- #
 # embedded-JSON extraction (SSR search page)
 # --------------------------------------------------------------------------- #
@@ -467,9 +466,9 @@ def _search(
     if not init_data:
         if blocked:
             raise AliExpressError(
-                f"blocked by AliExpress anti-bot ({blocked}) — direct search "
-                f"transport failed: {blocked}; browser fallback could not clear "
-                f"it (browser search transport failed: {browser_failure})."
+                f"blocked by AliExpress anti-bot ({blocked}); browser fallback "
+                f"could not clear it (browser search transport failed: "
+                f"{browser_failure})."
             )
         raise AliExpressError(
             "could not locate product data in the search page "

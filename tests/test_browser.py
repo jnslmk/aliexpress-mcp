@@ -118,3 +118,53 @@ def test_page_http_429_is_browser_blocked(monkeypatch, load):
     monkeypatch.setattr(browser, "_context", lambda _browser: Context())
     with pytest.raises(browser.BrowserBlocked, match="HTTP 429"):
         load("1005006730849854" if load is browser._fetch else "https://example.test/")
+
+
+@pytest.mark.parametrize("locale,host", [("de_DE", "de"), ("es_ES", "es"), ("en_US", "www")])
+def test_product_url_follows_the_market_locale(monkeypatch, locale, host):
+    from aliexpress_mcp import aliexpress_client as ac
+
+    urls: list[str] = []
+
+    class Response:
+        status = 429  # bails out of _fetch right after goto records the URL
+
+    class Page:
+        url = "https://www.aliexpress.com/"
+
+        def on(self, *_args):  # noqa: ANN002
+            pass
+
+        def goto(self, url, **_kwargs):  # noqa: ANN003
+            urls.append(url)
+            return Response()
+
+        def close(self):
+            pass
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ac, "LOCALE", locale)
+    monkeypatch.setattr(browser, "_ensure", lambda: object())
+    monkeypatch.setattr(browser, "_context", lambda _browser: Context())
+    with pytest.raises(browser.BrowserBlocked):
+        browser._fetch("1005006730849854")
+    # The product host must come from the same market config as the context —
+    # a German hostname under a non-German locale is exactly the mismatch the
+    # config exists to avoid.
+    assert urls == [f"https://{host}.aliexpress.com/item/1005006730849854.html"]
+
+
+def test_slow_page_wait_surfaces_as_browser_blocked():
+    from concurrent.futures import Future
+
+    # A page that outlasts the wall-clock budget: the future never completes,
+    # so the wait would raise a bare TimeoutError — which callers cannot
+    # catch, unlike the BrowserBlocked they actually handle.
+    with pytest.raises(browser.BrowserBlocked, match="wall-clock budget"):
+        browser._future_result(Future(), timeout=0.05)

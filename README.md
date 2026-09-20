@@ -102,6 +102,9 @@ vars (defaults in **bold**):
 | `AE_BROWSER_RETRY_DELAY_S` | **`1.5`** | Pause between attempts. Retrying instantly is what the anti-bot watches for. |
 | `AE_BROWSER_TIMEOUT_MS` | **`45000`** | Per-attempt budget. Rarely reached: a challenged attempt aborts as soon as RGV587 arrives. |
 | `AE_BROWSER_HEADLESS` | **`true`** | Headless suffices for AliExpress (verified). Unlike the sibling baumarkt-mcp, no Xvfb/headed display is needed. |
+| `AE_TIMEZONE` | **`Europe/Berlin`** | Timezone the browser context impersonates; tune it when targeting a non-German market. |
+| `AE_VIEWPORT_WIDTH` | **`1440`** | Browser viewport width. |
+| `AE_VIEWPORT_HEIGHT` | **`900`** | Browser viewport height. |
 
 These are pushed to AliExpress via the `aep_usuc_f` cookie (search) and the
 `_lang` / `_currency` / `country` MTop params (product detail). Any market the

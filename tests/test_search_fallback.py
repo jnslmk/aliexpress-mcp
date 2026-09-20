@@ -108,6 +108,7 @@ def test_search_raises_when_the_browser_fallback_also_fails(monkeypatch):
     with pytest.raises(ac.AliExpressError, match="browser fallback could not clear"):
         ac._search("xiaomi cable")
 
+
 def test_search_reports_the_browser_block_reason(monkeypatch):
     monkeypatch.setattr(ac, "_get_session", lambda: FakeSession(FakeResponse(BLOCKED_PAGE)))
 

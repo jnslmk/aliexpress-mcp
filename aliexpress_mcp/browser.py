@@ -106,6 +106,9 @@ def _context(browser: Any) -> Any:
     Locale follows the client's existing ``AE_LOCALE`` setting. Timezone and
     viewport keep their current values by default, but are configurable so a
     non-German market does not have to impersonate Berlin on a 1440x900 screen.
+    Measured, not assumed: reusing a context across back-to-back lookups gets
+    the *second* one answered ``FAIL_SYS_USER_VALIDATE / RGV587_ERROR``, while
+    the first request of a fresh context succeeds.
     """
     from aliexpress_mcp import aliexpress_client
 
@@ -162,6 +165,8 @@ def _teardown() -> None:
 
 def _fetch(pid: str) -> Optional[dict]:
     """Load the product page and return its own pdp.pc.query JSON. Worker only."""
+    from aliexpress_mcp import aliexpress_client
+
     ctx = _context(_ensure())
     page = ctx.new_page()
     captured: dict[str, Any] = {}
@@ -195,8 +200,13 @@ def _fetch(pid: str) -> Optional[dict]:
 
     page.on("response", on_response)
     try:
+        # Hit the same market the context impersonates: a de. page under an
+        # es_ES locale is the mismatch the market config exists to avoid.
+        # English has no subdomain; www is the English storefront.
+        lang = aliexpress_client.LOCALE.split("_")[0].lower()
+        host = "www" if lang == "en" else lang
         response = page.goto(
-            f"https://de.aliexpress.com/item/{pid}.html",
+            f"https://{host}.aliexpress.com/item/{pid}.html",
             wait_until="domcontentloaded",
             timeout=BROWSER_TIMEOUT_MS,
         )
@@ -276,6 +286,22 @@ def _run_guarded(label: str, load: Any) -> Optional[Any]:
     return None
 
 
+def _future_result(future: Any, timeout: float) -> Optional[Any]:
+    """Collect a worker future, classifying a wall-clock timeout as a block.
+
+    ``_run_guarded``'s worst case (attempts × goto + poll + retry sleeps) can
+    outlast the wait budget here, and callers only catch ``BrowserBlocked`` —
+    a bare ``TimeoutError`` would escape every classified-error layer.
+    """
+    try:
+        return future.result(timeout=timeout)
+    except TimeoutError as exc:
+        raise BrowserBlocked(
+            "browser page load outlasted its wall-clock budget "
+            "(persistently slow or silently challenged page)"
+        ) from exc
+
+
 def fetch_pdp_payload(pid: str) -> Optional[dict]:
     """Return the product's own ``pdp.pc.query`` JSON, or ``None``.
 
@@ -286,7 +312,7 @@ def fetch_pdp_payload(pid: str) -> Optional[dict]:
         return None
     with _state_lock:
         future = _executor.submit(_run_guarded, f"browser lookup for {pid}", lambda: _fetch(pid))
-    return future.result(timeout=(BROWSER_TIMEOUT_MS / 1000.0) + 60)
+    return _future_result(future, (BROWSER_TIMEOUT_MS / 1000.0) + 60)
 
 
 _TMD_MARKERS = ("_____tmd_____", "x5secdata")
@@ -296,11 +322,10 @@ def _is_punish_url(url: str) -> bool:
     """True when the page landed on an anti-bot punish/verification URL."""
     return "_____tmd_____" in url or "punish" in url.lower()
 
-def _response_status(response: Any) -> Optional[int]:
-    """Return a Playwright response status across real and fake responses."""
-    status = getattr(response, "status", None)
-    return status() if callable(status) else status
 
+def _response_status(response: Any) -> Optional[int]:
+    """Playwright response status; ``None`` when goto returned nothing."""
+    return getattr(response, "status", None)
 
 
 def _fetch_search(url: str) -> Optional[str]:
@@ -340,7 +365,7 @@ def fetch_search_html(url: str) -> Optional[str]:
         return None
     with _state_lock:
         future = _executor.submit(_run_guarded, f"browser search load for {url}", lambda: _fetch_search(url))
-    return future.result(timeout=(BROWSER_TIMEOUT_MS / 1000.0) + 60)
+    return _future_result(future, (BROWSER_TIMEOUT_MS / 1000.0) + 60)
 
 
 def shutdown() -> None:
