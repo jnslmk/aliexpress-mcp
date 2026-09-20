@@ -51,9 +51,10 @@ BLOCKED_PAGE = (
 
 
 class FakeResponse:
-    def __init__(self, text: str, status_code: int = 200) -> None:
+    def __init__(self, text: str, status_code: int = 200, headers: dict | None = None) -> None:
         self.text = text
         self.status_code = status_code
+        self.headers = headers or {}
 
 
 class FakeSession:
@@ -62,6 +63,13 @@ class FakeSession:
 
     def get(self, url, **kwargs):  # noqa: ANN001, ANN003
         return self.response
+
+
+@pytest.fixture(autouse=True)
+def _no_pacing(monkeypatch):
+    """Real pacing/backoff sleeps would slow every network-free test here."""
+    monkeypatch.setattr(ac, "_pace", lambda: None)
+    monkeypatch.setattr(ac, "_backoff_sleep", lambda *a, **k: None)
 
 
 def test_search_parses_normally_without_touching_the_browser(monkeypatch):
@@ -109,3 +117,82 @@ def test_search_does_not_treat_a_parser_miss_as_a_block(monkeypatch):
     )
     with pytest.raises(ac.AliExpressError, match="could not locate product data"):
         ac._search("xiaomi cable")
+
+
+# --------------------------------------------------------------------------- #
+# hardening: HTTP status handling, dedup, malformed fields
+# --------------------------------------------------------------------------- #
+
+
+def test_search_429_backs_off_honoring_retry_after_then_falls_back(monkeypatch):
+    sleeps: list[tuple] = []
+    monkeypatch.setattr(
+        ac,
+        "_get_session",
+        lambda: FakeSession(
+            FakeResponse("rate limited", status_code=429, headers={"Retry-After": "7"})
+        ),
+    )
+    monkeypatch.setattr(
+        ac, "_backoff_sleep", lambda attempt, retry_after=None: sleeps.append((attempt, retry_after))
+    )
+    monkeypatch.setattr(ac.browser, "fetch_search_html", lambda url: SEARCH_PAGE)
+    result = ac._search("xiaomi cable")
+    assert result["items"][0]["id"] == "1005006730849854"
+    assert sleeps == [(1, 7.0)]
+
+
+def test_search_non_retryable_status_raises_without_browser_fallback(monkeypatch):
+    monkeypatch.setattr(
+        ac, "_get_session", lambda: FakeSession(FakeResponse("", status_code=403))
+    )
+    monkeypatch.setattr(
+        ac.browser, "fetch_search_html", lambda url: pytest.fail("403 must not fall back")
+    )
+    with pytest.raises(ac.AliExpressHTTPError, match="search page returned HTTP 403"):
+        ac._search("xiaomi cable")
+
+
+def test_search_reports_which_signal_blocked_it(monkeypatch):
+    monkeypatch.setattr(
+        ac,
+        "_get_session",
+        lambda: FakeSession(
+            FakeResponse(BLOCKED_PAGE, status_code=429, headers={"Retry-After": "2"})
+        ),
+    )
+    monkeypatch.setattr(ac.browser, "fetch_search_html", lambda url: None)
+    with pytest.raises(ac.AliExpressError, match=r"anti-bot \(HTTP 429\)"):
+        ac._search("xiaomi cable")
+
+
+def test_dedupe_keeps_first_occurrence_and_passes_idless_items_through():
+    items = [
+        {"id": "1", "t": "a"},
+        {"id": "", "t": "x"},
+        {"id": "1", "t": "dup"},
+        {"id": "2", "t": "c"},
+    ]
+    assert ac._dedupe_by_id(items) == [{"id": "1", "t": "a"}, {"id": "", "t": "x"}, {"id": "2", "t": "c"}]
+
+
+def test_search_result_is_deduplicated_by_product_id(monkeypatch):
+    dup = json.loads(json.dumps(ITEM))
+    dup["title"] = {"displayTitle": "same listing, second slot"}
+    page = SEARCH_PAGE.replace(
+        json.dumps([ITEM]),
+        json.dumps([ITEM, dup, ITEM]),
+    )
+    monkeypatch.setattr(ac, "_get_session", lambda: FakeSession(FakeResponse(page)))
+    result = ac._search("xiaomi cable")
+    assert [i["title"] for i in result["items"]] == [
+        "Original Xiaomi 120W USB Typ-C Kabel"
+    ]
+    assert result["returned"] == 1
+
+
+def test_parse_search_item_names_a_malformed_field():
+    with pytest.raises(ac.AliExpressError, match="'prices'"):
+        ac._parse_search_item({"productId": "1", "prices": "3,29 €"})
+    with pytest.raises(ac.AliExpressError, match="'evaluation'"):
+        ac._parse_search_item({"productId": "1", "evaluation": 4.8})

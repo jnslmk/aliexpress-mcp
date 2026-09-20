@@ -27,7 +27,6 @@ from aliexpress_mcp.aliexpress_client import (
     CURRENCY,
     LOCALE,
     REGION,
-    AliExpressError,
     get_product,
     liveness,
     search,
@@ -175,23 +174,25 @@ def search_aliexpress(
     discount), star rating, orders-sold text, thumbnail image and product URL.
     Prices and titles follow the configured market (Germany / EUR by default).
     Pass a product's `id` to `get_aliexpress_product` for full details.
+
+    Failures (anti-bot blocks, a parser breaking against a changed page) are
+    raised as tool errors, not returned as an empty result — an empty result
+    can only mean "no hits".
     """
     limit = _resolve_limit(limit, max_results)
     page = _coerce_int(page, "page", ge=1) or 1
     min_price = _coerce_float(min_price, "min_price", ge=0)
     max_price = _coerce_float(max_price, "max_price", ge=0)
-    try:
-        return search(
-            query=query,
-            limit=limit,
-            sort=sort,
-            min_price=min_price,
-            max_price=max_price,
-            page=page,
-        )
-    except AliExpressError as exc:
-        log.warning("search_aliexpress failed: %s", exc)
-        return {"query": query, "returned": 0, "items": [], "error": str(exc)}
+    # Deliberately no error swallowing: a block or a broken parser must reach
+    # the MCP client as an error, not masquerade as a genuinely empty search.
+    return search(
+        query=query,
+        limit=limit,
+        sort=sort,
+        min_price=min_price,
+        max_price=max_price,
+        page=page,
+    )
 
 
 @mcp.tool
@@ -233,12 +234,13 @@ def get_aliexpress_product(
     `unavailable` is unknown, **not** absent from the listing — do not tell the
     user a product has no variants, no reviews or no shipping options on that
     basis; say that detail could not be retrieved.
+
+    Total failures (unknown id format, delisted listing, blocked transports)
+    are raised as tool errors — there is no success-shaped dict carrying an
+    `error` field that could be mistaken for a retrieved record.
     """
-    try:
-        return get_product(product)
-    except AliExpressError as exc:
-        log.warning("get_aliexpress_product failed: %s", exc)
-        return {"query": product, "error": str(exc)}
+    # Deliberately no error swallowing: see search_aliexpress.
+    return get_product(product)
 
 
 # --------------------------------------------------------------------------- #

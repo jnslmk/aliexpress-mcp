@@ -62,9 +62,12 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
@@ -86,9 +89,24 @@ IMPERSONATE = os.getenv("AE_IMPERSONATE", "chrome")
 
 # The cookie AliExpress reads for ship-to region, display currency and locale.
 # Setting it makes both the SSR search page and the MTop API answer in EUR / de_DE.
-_USUC_COOKIE = f"site=glo&c_tp={CURRENCY}&region={REGION}&b_locale={LOCALE}"
+# AE_USUC_COOKIE overrides it for the direct transport *and* the browser one
+# (browser.py reads this same value), so the two transports cannot drift apart.
+USUC_COOKIE = os.getenv("AE_USUC_COOKIE") or f"site=glo&c_tp={CURRENCY}&region={REGION}&b_locale={LOCALE}"
+
+# A realistic current Chrome UA plus a browser-shaped Accept: AliExpress
+# refuses requests that look like scripts even when the TLS fingerprint is
+# Chrome's — and curl_cffi's impersonation alone does not set session headers.
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+)
 
 _BASE_HEADERS = {
+    "User-Agent": _USER_AGENT,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
     "Accept-Language": f"{LOCALE.replace('_', '-')},{LOCALE.split('_')[0]};q=0.9,en;q=0.8",
     "Referer": "https://www.aliexpress.com/",
 }
@@ -147,7 +165,7 @@ def _get_session() -> requests.Session:
             if _session is None:
                 s = requests.Session(impersonate=IMPERSONATE)
                 s.headers.update(_BASE_HEADERS)
-                s.cookies.set("aep_usuc_f", _USUC_COOKIE, domain=".aliexpress.com")
+                s.cookies.set("aep_usuc_f", USUC_COOKIE, domain=".aliexpress.com")
                 _session = s
     return _session
 
@@ -160,6 +178,36 @@ def _get_session() -> requests.Session:
 # queue here instead of hitting AliExpress at once.
 MAX_CONCURRENT = int(os.getenv("AE_MAX_CONCURRENT", "2"))
 _gate = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+
+# --------------------------------------------------------------------------- #
+# pacing and backoff (stdlib only: random + time)
+# --------------------------------------------------------------------------- #
+
+# Uniform jitter range inserted before every direct HTTP request. Bursts of
+# evenly timed requests from one IP are exactly what the anti-bot looks for.
+_REQUEST_GAP_S = (1.0, 3.0)
+# Capped exponential backoff before a retry or a fallback transport.
+_BACKOFF_BASE_S = 2.0
+_BACKOFF_CAP_S = 30.0
+
+
+def _pace() -> None:
+    """Jittered pause before a direct HTTP request (inter-request pacing)."""
+    time.sleep(random.uniform(*_REQUEST_GAP_S))
+
+
+def _backoff_sleep(attempt: int, retry_after: Optional[float] = None) -> None:
+    """Capped exponential backoff before a retry or a fallback transport.
+
+    A server-provided ``Retry-After`` is honored up to the cap: a server asking
+    for minutes of waiting would blow the caller's timeout long before the
+    wait paid off, and the cooldown logic owns the long-horizon case.
+    """
+    delay = min(_BACKOFF_BASE_S * 2 ** (attempt - 1), _BACKOFF_CAP_S)
+    if retry_after is not None:
+        delay = max(delay, min(retry_after, _BACKOFF_CAP_S))
+    time.sleep(delay)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,6 +301,42 @@ def _img_url(raw: Optional[str]) -> Optional[str]:
     return raw
 
 
+def _mapping(value: Any, field: str) -> dict:
+    """Return ``value`` as a dict, or raise AliExpressError naming the field.
+
+    The embedded search JSON is parsed defensively everywhere else; a field
+    that changed from object to scalar should fail loudly with its name, not
+    surface as a baffling ``AttributeError`` mid-extraction.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise AliExpressError(
+            f"malformed search field {field!r}: expected an object, "
+            f"got {type(value).__name__}"
+        )
+    return value
+
+
+def _dedupe_by_id(items: list[dict]) -> list[dict]:
+    """Keep the first occurrence of each non-empty product id; order preserved.
+
+    AliExpress's search payload repeats the same listing across slots; without
+    this a page of 40 can carry a dozen duplicates and burn the caller's limit.
+    Items without an id cannot be told apart, so they pass through.
+    """
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for item in items:
+        pid = item.get("id") or ""
+        if pid:
+            if pid in seen:
+                continue
+            seen.add(pid)
+        unique.append(item)
+    return unique
+
+
 def _parse_search_item(product: dict) -> dict:
     """Flatten one ``_init_data_`` product entry into a clean dict."""
     pid = str(product.get("productId") or product.get("redirectedId") or "")
@@ -263,13 +347,13 @@ def _parse_search_item(product: dict) -> dict:
     else:
         title = str(title_mod)
 
-    prices = product.get("prices") or {}
-    sale = prices.get("salePrice") or {}
-    original = prices.get("originalPrice") or {}
+    prices = _mapping(product.get("prices"), "prices")
+    sale = _mapping(prices.get("salePrice"), "prices.salePrice")
+    original = _mapping(prices.get("originalPrice"), "prices.originalPrice")
 
-    evaluation = product.get("evaluation") or {}
-    trade = product.get("trade") or {}
-    image = product.get("image") or {}
+    evaluation = _mapping(product.get("evaluation"), "evaluation")
+    trade = _mapping(product.get("trade"), "trade")
+    image = _mapping(product.get("image"), "image")
 
     return {
         "id": pid,
@@ -327,30 +411,47 @@ def _search(
         params["maxPrice"] = str(max_price)
 
     session = _get_session()
+    _pace()
     try:
         resp = session.get(url, params=params, timeout=30)
     except Exception as exc:  # noqa: BLE001 - surface any transport error cleanly
         raise AliExpressError(f"search request failed: {exc}") from exc
 
-    if resp.status_code >= 400:
-        raise AliExpressError(f"search returned HTTP {resp.status_code}")
-
     html = resp.text
-    init_data = _extract_init_data(html)
-    blocked = init_data is None and ("_____tmd_____" in html or "punish" in html.lower())
+    init_data = None
+    blocked = ""
+    retry_after: Optional[float] = None
+    if resp.status_code >= 400:
+        err = AliExpressHTTPError("search page", resp.status_code, _retry_after_seconds(resp))
+        if not err.retryable:
+            raise err
+        # A retryable status feeds the fallback policy: back off (honoring
+        # Retry-After), then let the browser transport try the same URL.
+        blocked = f"HTTP {err.status}"
+        retry_after = err.retry_after
+        log.warning("search page %s; backing off before the browser fallback", err)
+    else:
+        init_data = _extract_init_data(html)
+        if init_data is None and ("_____tmd_____" in html or "punish" in html.lower()):
+            blocked = "TMD challenge"
 
     if blocked:
         # The plain HTTP call was anti-bot gated, same as product detail's
         # MTop path — fall back to a real browser loading the very same URL.
         full_url = f"{url}?{urlencode(params)}" if params else url
-        browser_html = browser.fetch_search_html(full_url)
+        _backoff_sleep(1, retry_after)
+        try:
+            browser_html = browser.fetch_search_html(full_url)
+        except browser.BrowserBlocked as exc:
+            log.warning("browser search fallback was also blocked: %s", exc)
+            browser_html = None
         if browser_html:
             init_data = _extract_init_data(browser_html)
 
     if not init_data:
         if blocked:
             raise AliExpressError(
-                "blocked by AliExpress anti-bot (TMD challenge) — the search page "
+                f"blocked by AliExpress anti-bot ({blocked}) — the search page "
                 "returned a punish/verification page instead of results, and the "
                 "browser fallback could not clear it either."
             )
@@ -369,7 +470,7 @@ def _search(
     except (KeyError, TypeError) as exc:
         raise AliExpressError(f"unexpected search data structure: {exc}") from exc
 
-    items = [_parse_search_item(p) for p in raw_items[: max(1, limit)]]
+    items = _dedupe_by_id([_parse_search_item(p) for p in raw_items[: max(1, limit)]])
     return {
         "query": query,
         "region": REGION,
@@ -392,6 +493,44 @@ _token_lock = threading.Lock()
 
 class AliExpressError(RuntimeError):
     """Raised when AliExpress blocks the request or returns no usable data."""
+
+
+# Statuses worth retrying (with backoff) or escalating to a fallback transport;
+# anything else is a hard answer that must not be retried into more traffic.
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
+class AliExpressHTTPError(AliExpressError):
+    """HTTP-level failure from a direct request, classified for retry policy.
+
+    Carries the status, a parsed ``Retry-After`` (seconds, when the server
+    sent one) and whether the status feeds the retry/fallback policy at all.
+    """
+
+    def __init__(self, what: str, status: int, retry_after: Optional[float] = None) -> None:
+        self.status = status
+        self.retry_after = retry_after
+        self.retryable = status in _RETRYABLE_STATUSES
+        super().__init__(f"{what} returned HTTP {status}")
+
+
+def _retry_after_seconds(resp: Any) -> Optional[float]:
+    """Parse a ``Retry-After`` header (delay-seconds or HTTP-date), if present."""
+    headers = getattr(resp, "headers", None) or {}
+    value = headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        due = parsedate_to_datetime(value)
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        return max(0.0, (due - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        return None
 
 
 def _sign(token: str, timestamp: str, data_str: str) -> str:
@@ -422,7 +561,13 @@ def _mtop_get(api: str, version: str, data_dict: dict) -> dict:
         "dataType": "json",
         "data": data_str,
     }
+    _pace()
     resp = session.get(url, params=params, timeout=15)
+    if resp.status_code >= 400:
+        # Before this check a 429/5xx body was fed to the JSON parser and came
+        # back as a misleading PARSE_ERROR; now the status is classified and
+        # the retry policy decides.
+        raise AliExpressHTTPError(f"MTop {api}", resp.status_code, _retry_after_seconds(resp))
 
     tk = resp.cookies.get("_m_h5_tk")
     if tk:
@@ -625,12 +770,21 @@ def _mark_mtop_blocked() -> None:
         _mtop_blocked_until = time.time() + _MTOP_COOLDOWN
 
 
-def _get_product_via_mtop(pid: str) -> Optional[dict]:
-    """Rich product record via MTop, or ``None`` if MTop cannot serve it.
+def _get_product_via_mtop(pid: str) -> tuple[Optional[dict], Optional[str]]:
+    """Rich product record via MTop.
 
-    Raises only for a definitive *product-level* answer (not found). An
-    anti-bot refusal returns ``None`` after arming the cooldown, so the caller
-    can fall back instead of failing the whole request.
+    Returns ``(record, transport_failure)``:
+
+    * ``(record, None)`` — MTop served the record.
+    * ``(None, None)`` — MTop answered with a definitive anti-bot refusal
+      (the cooldown is armed); the caller's note already names the gate.
+    * ``(None, reason)`` — MTop itself could not be reached or served nothing
+      usable; ``reason`` says what happened, so a transport outage is not
+      mistaken for anti-bot gating.
+
+    Raises only for a definitive *product-level* answer (not found). A
+    retryable HTTP status backs off (honoring ``Retry-After``) before the
+    next API is tried; a non-retryable one stops the MTop attempt at once.
     """
     data = {
         "productId": pid,
@@ -640,11 +794,22 @@ def _get_product_via_mtop(pid: str) -> Optional[dict]:
         "clientType": "pc",
     }
 
-    for api, version in _MTOP_APIS:
+    failure: Optional[str] = None
+    for attempt, (api, version) in enumerate(_MTOP_APIS, start=1):
         try:
             result = _mtop_request(api, version, data)
+        except AliExpressHTTPError as exc:
+            failure = f"{api} failed: {exc}"
+            log.warning("MTop %s transport failure: %s", api, exc)
+            if not exc.retryable:
+                break
+            _backoff_sleep(attempt, exc.retry_after)
+            continue
         except Exception as exc:  # noqa: BLE001
-            log.debug("MTop %s transport error: %s", api, exc)
+            failure = f"{api} failed: {exc}"
+            # WARNING, not debug: a transport outage and an anti-bot gate need
+            # different fixes, and only one of them shows up in the logs here.
+            log.warning("MTop %s transport failure: %s", api, exc)
             continue
         ret = _ret_str(result)
         if "SUCCESS" in ret:
@@ -654,7 +819,9 @@ def _get_product_via_mtop(pid: str) -> Optional[dict]:
                 raise AliExpressError(f"product {pid} not found (delisted or unavailable)")
             extracted = _extract_product(result)
             if extracted and extracted.get("title"):
-                return extracted
+                return extracted, None
+            failure = f"{api} answered SUCCESS but the payload had no usable record"
+            log.warning("%s", failure)
             continue
         if "FAIL_SYS_USER_VALIDATE" in ret or "RGV587_ERROR" in ret:
             _mark_mtop_blocked()
@@ -664,8 +831,13 @@ def _get_product_via_mtop(pid: str) -> Optional[dict]:
                 ret.split("::")[0],
                 _MTOP_COOLDOWN,
             )
-            return None
-    return None
+            return None, None
+        # An unrecognized ret is neither the known gate nor success: record it,
+        # or the fall-through below would come back as (None, None) and the
+        # caller would narrate anti-bot gating for what is an API failure.
+        failure = f"{api} answered {ret.split('::')[0]}"
+        log.warning("%s", failure)
+    return None, failure
 
 
 def _item_page_identity(pid: str) -> dict:
@@ -676,6 +848,7 @@ def _item_page_identity(pid: str) -> dict:
     facts left in the HTML. Deliberately not parsed for price: it is not there.
     """
     session = _get_session()
+    _pace()
     url = f"https://www.aliexpress.com/item/{pid}.html"
     try:
         resp = session.get(url, timeout=30)
@@ -683,7 +856,7 @@ def _item_page_identity(pid: str) -> dict:
         raise AliExpressError(f"product page request failed: {exc}") from exc
 
     if resp.status_code >= 400:
-        raise AliExpressError(f"product page returned HTTP {resp.status_code}")
+        raise AliExpressHTTPError("product page", resp.status_code, _retry_after_seconds(resp))
 
     html_text = resp.text
     if "_____tmd_____" in html_text or "x5secdata" in html_text:
@@ -867,27 +1040,38 @@ def _get_product(product: str) -> dict:
             "for this call."
         )
     else:
-        mtop_record = _get_product_via_mtop(pid)
+        mtop_record, mtop_failure = _get_product_via_mtop(pid)
         if mtop_record:
             mtop_record["source"] = "mtop"
             mtop_record["partial"] = False
             return mtop_record
-        note = (
-            "MTop product detail is anti-bot gated (FAIL_SYS_USER_VALIDATE / "
-            "RGV587)."
-        )
+        if mtop_failure is None:
+            note = (
+                "MTop product detail is anti-bot gated (FAIL_SYS_USER_VALIDATE / "
+                "RGV587)."
+            )
+        else:
+            note = f"MTop product detail was unavailable ({mtop_failure})."
+        # MTop just failed or got blocked; do not pile a browser page load on
+        # top of it without a pause.
+        _backoff_sleep(1)
 
-    browser_record = _get_product_via_browser(pid)
+    browser_note = (
+        " The browser transport could not retrieve it either, so the record "
+        "below is composed from the product page and search results."
+    )
+    try:
+        browser_record = _get_product_via_browser(pid)
+    except browser.BrowserBlocked as exc:
+        log.warning("browser transport was blocked for %s: %s", pid, exc)
+        browser_record = None
+        browser_note = f" The browser transport was blocked as well ({exc})."
     if browser_record:
         browser_record["source"] = "browser"
         browser_record["partial"] = False
         return browser_record
 
-    return _get_product_via_ssr(
-        pid,
-        note + " The browser transport could not retrieve it either, so the "
-        "record below is composed from the product page and search results.",
-    )
+    return _get_product_via_ssr(pid, note + browser_note)
 
 
 def liveness() -> dict:

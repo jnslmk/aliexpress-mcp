@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from aliexpress_mcp import aliexpress_client as ac
 from aliexpress_mcp import server
 
 
@@ -43,3 +44,35 @@ def test_resolve_limit_rejects_disagreeing_values():
 
 def test_resolve_limit_clamps_to_the_existing_cap():
     assert server._resolve_limit(None, 999) == 60
+
+
+# --------------------------------------------------------------------------- #
+# fail-loud tool boundary
+# --------------------------------------------------------------------------- #
+# FastMCP turns a raised exception into an MCP tool error; the old behaviour
+# (catching AliExpressError and returning an empty/success-shaped dict) made a
+# block or a broken parser indistinguishable from "no hits".
+
+
+def test_search_tool_propagates_aliexpress_errors(monkeypatch):
+    def blocked(**kwargs):  # noqa: ANN003
+        raise ac.AliExpressError("blocked by AliExpress anti-bot (TMD challenge)")
+
+    monkeypatch.setattr(server, "search", blocked)
+    with pytest.raises(ac.AliExpressError, match="blocked by AliExpress"):
+        server.search_aliexpress(query="usb kabel")
+
+
+def test_product_tool_propagates_aliexpress_errors(monkeypatch):
+    def missing(product):  # noqa: ANN001
+        raise ac.AliExpressError("product 1 not found (delisted or unavailable)")
+
+    monkeypatch.setattr(server, "get_product", missing)
+    with pytest.raises(ac.AliExpressError, match="not found"):
+        server.get_aliexpress_product(product="1")
+
+
+def test_search_tool_still_returns_a_genuinely_empty_result(monkeypatch):
+    # An empty result must now mean exactly one thing: the client found no hits.
+    monkeypatch.setattr(server, "search", lambda **kwargs: {"returned": 0, "items": []})
+    assert server.search_aliexpress(query="usb kabel") == {"returned": 0, "items": []}

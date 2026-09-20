@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -63,6 +64,14 @@ _state_lock = threading.Lock()
 
 class BrowserUnavailable(RuntimeError):
     """Raised when the browser transport cannot run at all (not: page failed)."""
+
+
+class BrowserBlocked(RuntimeError):
+    """AliExpress served a clear anti-bot block (TMD punish page).
+
+    Unlike a transient challenge this is an IP-level verdict: retrying earns a
+    longer punish. The reason travels with the error into the caller's note.
+    """
 
 
 def _start() -> tuple[Any, Any]:
@@ -108,14 +117,23 @@ def _context(browser: Any) -> Any:
     )
     ctx.add_cookies([{
         "name": "aep_usuc_f",
-        "value": os.getenv(
-            "AE_USUC_COOKIE", "site=glo&c_tp=EUR&region=DE&b_locale=de_DE"
-        ),
+        # Same cookie the direct HTTP transport sends (aliexpress_client owns
+        # it, AE_USUC_COOKIE overrides it for both), so the two transports
+        # always agree on region / currency / locale. Late import: the client
+        # imports this module, so a module-level import would be circular.
+        "value": _usuc_cookie(),
         "domain": ".aliexpress.com",
         "path": "/",
     }])
     ctx.set_default_timeout(BROWSER_TIMEOUT_MS)
     return ctx
+
+
+def _usuc_cookie() -> str:
+    """The shared market cookie; lives in aliexpress_client (market config)."""
+    from aliexpress_mcp import aliexpress_client
+
+    return aliexpress_client.USUC_COOKIE
 
 
 def _ensure() -> Any:
@@ -180,6 +198,8 @@ def _fetch(pid: str) -> Optional[dict]:
             wait_until="domcontentloaded",
             timeout=BROWSER_TIMEOUT_MS,
         )
+        if _is_punish_url(page.url):
+            raise BrowserBlocked(f"product page was redirected to {page.url[:120]}")
         # Poll via page.wait_for_timeout rather than a threading.Event: the sync
         # Playwright API only dispatches "response" events while control is
         # inside a Playwright call, so blocking on an Event would park this
@@ -213,14 +233,22 @@ def _fetch(pid: str) -> Optional[dict]:
                 pass
 
 
+def _retry_delay(attempt: int) -> float:
+    """Bounded exponential backoff with jitter, seeded by the configured base."""
+    return min(BROWSER_RETRY_DELAY_S * 2 ** (attempt - 1), 8.0) * random.uniform(0.5, 1.5)
+
+
 def _run_guarded(label: str, load: Any) -> Optional[Any]:
     """Retry ``load()`` in a fresh context on failure. Worker thread only.
 
     AliExpress challenges a *proportion* of page loads rather than locking on:
     an attempt that gets RGV587 (or a search punish page) is routinely
-    followed by one that succeeds in ~2s. Retrying is therefore worth far more
-    than it costs — but it is capped, because hammering a site that just said
-    no is how the whole IP gets a multi-hour punish.
+    followed by one that succeeds. Transient failures are therefore retried
+    with bounded, jittered exponential delays — capped, because hammering a
+    site that just said no is how the whole IP gets a multi-hour punish. A
+    clear TMD punish page is different: it stops the loop at once and raises
+    ``BrowserBlocked`` with the reason, so the caller can report the block
+    instead of a generic "browser could not retrieve it".
     """
     last_exc: Optional[Exception] = None
     for attempt in range(1, BROWSER_ATTEMPTS + 1):
@@ -230,14 +258,15 @@ def _run_guarded(label: str, load: Any) -> Optional[Any]:
                 if attempt > 1:
                     log.info("%s succeeded on attempt %s", label, attempt)
                 return result
+        except BrowserBlocked as exc:
+            log.warning("%s was blocked by AliExpress anti-bot: %s", label, exc)
+            raise
         except Exception as exc:  # noqa: BLE001 - a bad page must not wedge the browser
             last_exc = exc
             log.info("%s errored (%s); restarting browser", label, exc)
             _teardown()
         if attempt < BROWSER_ATTEMPTS:
-            # A short, deliberate pause: retrying instantly is what the anti-bot
-            # is watching for.
-            time.sleep(BROWSER_RETRY_DELAY_S)
+            time.sleep(_retry_delay(attempt))
     if last_exc is None:
         log.info("%s gave up after %s attempts", label, BROWSER_ATTEMPTS)
     return None
@@ -259,21 +288,27 @@ def fetch_pdp_payload(pid: str) -> Optional[dict]:
 _TMD_MARKERS = ("_____tmd_____", "x5secdata")
 
 
+def _is_punish_url(url: str) -> bool:
+    """True when the page landed on an anti-bot punish/verification URL."""
+    return "_____tmd_____" in url or "punish" in url.lower()
+
+
 def _fetch_search(url: str) -> Optional[str]:
-    """Load the SSR search page and return its HTML, or ``None`` if challenged.
+    """Load the SSR search page and return its HTML.
 
     Worker thread only. Unlike product detail, nothing needs intercepting:
     the search page is server-rendered, so the HTML the navigation itself
     receives already contains (or, when challenged, withholds) the
-    ``_init_data_`` blob ``_extract_init_data`` parses.
+    ``_init_data_`` blob ``_extract_init_data`` parses. A clear punish page
+    raises ``BrowserBlocked`` rather than retrying.
     """
     ctx = _context(_ensure())
     page = ctx.new_page()
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT_MS)
         html = page.content()
-        if any(marker in html for marker in _TMD_MARKERS):
-            return None
+        if any(marker in html for marker in _TMD_MARKERS) or _is_punish_url(page.url):
+            raise BrowserBlocked(f"search page served an anti-bot punish page ({page.url[:120]})")
         return html
     finally:
         for obj in (page, ctx):

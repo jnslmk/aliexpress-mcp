@@ -80,6 +80,13 @@ def _reset_cooldown():
     ac._mtop_blocked_until = 0.0
 
 
+@pytest.fixture(autouse=True)
+def _no_pacing(monkeypatch):
+    """Real pacing/backoff sleeps would slow every network-free test here."""
+    monkeypatch.setattr(ac, "_pace", lambda: None)
+    monkeypatch.setattr(ac, "_backoff_sleep", lambda *a, **k: None)
+
+
 @pytest.fixture
 def item_page(monkeypatch):
     session = FakeSession(FakeResponse(ITEM_PAGE))
@@ -277,7 +284,9 @@ def test_ssr_record_says_blocked_rather_than_not_found(item_page, monkeypatch):
 
 def test_get_product_prefers_mtop_when_it_works(monkeypatch):
     monkeypatch.setattr(
-        ac, "_get_product_via_mtop", lambda pid: {"id": pid, "title": "full record"}
+        ac,
+        "_get_product_via_mtop",
+        lambda pid: ({"id": pid, "title": "full record"}, None),
     )
     monkeypatch.setattr(
         ac, "_get_product_via_browser", lambda pid: pytest.fail("no browser needed")
@@ -292,7 +301,7 @@ def test_get_product_prefers_mtop_when_it_works(monkeypatch):
 
 def test_get_product_uses_the_browser_when_mtop_is_gated(monkeypatch):
     """The browser is the real answer to the gate — not the partial composite."""
-    monkeypatch.setattr(ac, "_get_product_via_mtop", lambda pid: None)
+    monkeypatch.setattr(ac, "_get_product_via_mtop", lambda pid: (None, None))
     monkeypatch.setattr(
         ac, "_get_product_via_browser", lambda pid: {"id": pid, "title": "full"}
     )
@@ -305,7 +314,7 @@ def test_get_product_uses_the_browser_when_mtop_is_gated(monkeypatch):
 
 
 def test_get_product_falls_back_to_ssr_only_when_the_browser_also_fails(monkeypatch):
-    monkeypatch.setattr(ac, "_get_product_via_mtop", lambda pid: None)
+    monkeypatch.setattr(ac, "_get_product_via_mtop", lambda pid: (None, None))
     monkeypatch.setattr(ac, "_get_product_via_browser", lambda pid: None)
     monkeypatch.setattr(
         ac, "_get_product_via_ssr", lambda pid, note: {"id": pid, "note": note}
@@ -313,6 +322,34 @@ def test_get_product_falls_back_to_ssr_only_when_the_browser_also_fails(monkeypa
     note = ac._get_product(PID)["note"]
     assert "RGV587" in note
     assert "browser transport could not retrieve it" in note
+
+
+def test_get_product_reports_an_mtop_transport_outage_as_such(monkeypatch):
+    """A dead MTop must not be narrated as anti-bot gating in the note."""
+    monkeypatch.setattr(
+        ac, "_get_product_via_mtop", lambda pid: (None, "mtop.aliexpress.pdp.pc.query failed: connection reset")
+    )
+    monkeypatch.setattr(ac, "_get_product_via_browser", lambda pid: None)
+    monkeypatch.setattr(
+        ac, "_get_product_via_ssr", lambda pid, note: {"id": pid, "note": note}
+    )
+    note = ac._get_product(PID)["note"]
+    assert "was unavailable" in note
+    assert "connection reset" in note
+
+
+def test_get_product_reports_a_blocked_browser_transport(monkeypatch):
+    """A TMD punish in the browser must name the block, not a vague failure."""
+    monkeypatch.setattr(ac, "_get_product_via_mtop", lambda pid: (None, None))
+    monkeypatch.setattr(ac, "_get_product_via_ssr", lambda pid, note: {"id": pid, "note": note})
+
+    def blocked(pid):  # noqa: ANN001
+        raise ac.browser.BrowserBlocked("product page was redirected to a punish page")
+
+    monkeypatch.setattr(ac, "_get_product_via_browser", blocked)
+    note = ac._get_product(PID)["note"]
+    assert "blocked as well" in note
+    assert "punish page" in note
 
 
 def test_get_product_still_tries_the_browser_during_mtop_cooldown(monkeypatch):
@@ -379,7 +416,8 @@ def test_mtop_block_arms_the_cooldown(monkeypatch):
         "_mtop_request",
         lambda api, v, d: {"ret": ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::SM::x"]},
     )
-    assert ac._get_product_via_mtop(PID) is None
+    # (None, None): the gate is the known story, so no separate failure reason.
+    assert ac._get_product_via_mtop(PID) == (None, None)
     assert ac._mtop_in_cooldown()
 
 
@@ -395,3 +433,102 @@ def test_mtop_reports_a_delisted_product_rather_than_falling_back(monkeypatch):
     )
     with pytest.raises(ac.AliExpressError, match="not found"):
         ac._get_product_via_mtop(PID)
+
+
+# --------------------------------------------------------------------------- #
+# MTop HTTP status classification (0.3.x hardening)
+# --------------------------------------------------------------------------- #
+
+
+def test_http_error_classifies_retryable_statuses():
+    retryable = ac.AliExpressHTTPError("MTop x", 429, 7.0)
+    assert retryable.retryable and retryable.retry_after == 7.0
+    assert ac.AliExpressHTTPError("MTop x", 503).retryable
+    assert not ac.AliExpressHTTPError("MTop x", 403).retryable
+
+
+def test_retry_after_parses_seconds_dates_and_absence():
+    class R:
+        headers = {"Retry-After": "5"}
+
+    class D:
+        headers = {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}  # long past
+
+    class N:
+        pass
+
+    assert ac._retry_after_seconds(R()) == 5.0
+    assert ac._retry_after_seconds(D()) == 0.0
+    assert ac._retry_after_seconds(N()) is None
+
+
+def test_mtop_429_backs_off_with_retry_after_and_tries_the_next_api(monkeypatch):
+    calls: list[str] = []
+    sleeps: list[tuple] = []
+    monkeypatch.setattr(
+        ac, "_backoff_sleep", lambda attempt, retry_after=None: sleeps.append((attempt, retry_after))
+    )
+
+    def flaky(api, v, d):  # noqa: ANN001
+        calls.append(api)
+        if len(calls) == 1:
+            raise ac.AliExpressHTTPError(f"MTop {api}", 429, 7.0)
+        # An unusable (non-SUCCESS, non-block) answer: the loop ends and the
+        # last recorded transport failure is what comes back.
+        return {"ret": ["FAIL_SYS_TIMEOUT"]}
+
+    monkeypatch.setattr(ac, "_mtop_request", flaky)
+    record, failure = ac._get_product_via_mtop(PID)
+    assert record is None
+    # The retryable 429 fed the retry policy: backoff honored Retry-After,
+    # then the second API was still tried.
+    assert len(calls) == 2
+    assert sleeps == [(1, 7.0)]
+    # The final failure names the most recent answer (the second API's).
+    assert "FAIL_SYS_TIMEOUT" in failure
+
+
+def test_mtop_unrecognized_ret_is_not_mistaken_for_the_gate(monkeypatch):
+    """Both APIs answering an unrecognized ret must not read as anti-bot gating.
+
+    Before this was pinned, the fall-through returned (None, None) — indistinguishable
+    from the definitive RGV587 gate — and _get_product narrated anti-bot gating
+    for what is an API failure, with the cooldown never armed.
+    """
+    monkeypatch.setattr(
+        ac,
+        "_mtop_request",
+        lambda api, v, d: {"ret": ["FAIL_SYS_TIMEOUT::read timed out"]},
+    )
+    record, failure = ac._get_product_via_mtop(PID)
+    assert record is None
+    assert failure and "FAIL_SYS_TIMEOUT" in failure
+    # The gate branch, not the failure branch, is what arms the cooldown.
+    assert not ac._mtop_in_cooldown()
+
+
+def test_mtop_non_retryable_status_stops_without_retry_or_backoff(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        ac, "_backoff_sleep", lambda *a, **k: pytest.fail("403 must not back off")
+    )
+
+    def forbidden(api, v, d):  # noqa: ANN001
+        calls.append(api)
+        raise ac.AliExpressHTTPError(f"MTop {api}", 403)
+
+    monkeypatch.setattr(ac, "_mtop_request", forbidden)
+    record, failure = ac._get_product_via_mtop(PID)
+    assert record is None
+    assert len(calls) == 1  # second API never tried
+    assert "HTTP 403" in failure
+
+
+def test_mtop_connection_error_is_reported_as_a_reason(monkeypatch):
+    def dead(api, v, d):  # noqa: ANN001
+        raise ConnectionError("connection reset by peer")
+
+    monkeypatch.setattr(ac, "_mtop_request", dead)
+    record, failure = ac._get_product_via_mtop(PID)
+    assert record is None
+    assert "connection reset by peer" in failure
