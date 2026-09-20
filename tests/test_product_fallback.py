@@ -488,6 +488,54 @@ def test_mtop_429_backs_off_with_retry_after_and_tries_the_next_api(monkeypatch)
     assert "FAIL_SYS_TIMEOUT" in failure
 
 
+def test_backoff_delay_computation_is_capped_and_honors_retry_after():
+    assert ac._backoff_delay(1) == 2.0
+    assert ac._backoff_delay(2) == 4.0
+    assert ac._backoff_delay(5) == 30.0
+    assert ac._backoff_delay(1, 7.0) == 7.0
+    assert ac._backoff_delay(2, 1.0) == 4.0
+    assert ac._backoff_delay(1, 90.0) == 30.0
+
+
+def test_last_mtop_retry_does_not_double_sleep_before_browser_fallback(monkeypatch):
+    sleeps: list[tuple] = []
+    monkeypatch.setattr(
+        ac, "_backoff_sleep", lambda attempt, retry_after=None: sleeps.append((attempt, retry_after))
+    )
+
+    def rate_limited(api, v, d):  # noqa: ANN001
+        raise ac.AliExpressHTTPError(f"MTop {api}", 429, 7.0)
+
+    monkeypatch.setattr(ac, "_mtop_request", rate_limited)
+    monkeypatch.setattr(ac, "_get_product_via_browser", lambda pid: None)
+    monkeypatch.setattr(
+        ac, "_get_product_via_ssr", lambda pid, note: {"id": pid, "note": note}
+    )
+    ac._get_product(PID)
+    assert sleeps == [(1, 7.0), (1, None)]
+
+
+def test_mtop_request_uses_json_accept_header(monkeypatch):
+    class Response:
+        status_code = 200
+        text = '{"ret":["SUCCESS"],"data":{}}'
+        cookies = {}
+
+    class Session:
+        def __init__(self):
+            self.kwargs = None
+
+        def get(self, _url, **kwargs):  # noqa: ANN001
+            self.kwargs = kwargs
+            return Response()
+
+    session = Session()
+    monkeypatch.setattr(ac, "_get_session", lambda: session)
+    monkeypatch.setattr(ac, "_pace", lambda: None)
+    ac._mtop_get("mtop.test", "1.0", {})
+    assert session.kwargs["headers"]["Accept"] == "application/json, text/plain, */*"
+
+
 def test_mtop_unrecognized_ret_is_not_mistaken_for_the_gate(monkeypatch):
     """Both APIs answering an unrecognized ret must not read as anti-bot gating.
 

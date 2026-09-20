@@ -56,3 +56,65 @@ def test_retry_delay_is_bounded_and_jittered(monkeypatch):
     assert browser._retry_delay(50) == pytest.approx(8.0 * 1.5)
     monkeypatch.setattr(browser.random, "uniform", lambda a, b: a)  # min jitter
     assert browser._retry_delay(1) == pytest.approx(browser.BROWSER_RETRY_DELAY_S * 0.5)
+
+
+def test_context_uses_market_locale_and_configured_browser_dimensions(monkeypatch):
+    from aliexpress_mcp import aliexpress_client as ac
+
+    options: dict = {}
+
+    class Context:
+        def add_cookies(self, cookies):  # noqa: ANN001
+            self.cookies = cookies
+
+        def set_default_timeout(self, timeout):  # noqa: ANN001
+            self.timeout = timeout
+
+    class FakeBrowser:
+        def new_context(self, **kwargs):  # noqa: ANN003
+            options.update(kwargs)
+            return Context()
+
+    monkeypatch.setattr(ac, "LOCALE", "en_US")
+    monkeypatch.setenv("AE_TIMEZONE", "America/New_York")
+    monkeypatch.setenv("AE_VIEWPORT_WIDTH", "1280")
+    monkeypatch.setenv("AE_VIEWPORT_HEIGHT", "720")
+    monkeypatch.setattr(browser, "_usuc_cookie", lambda: "market-cookie")
+
+    ctx = browser._context(FakeBrowser())
+    assert options == {
+        "locale": "en-US",
+        "timezone_id": "America/New_York",
+        "viewport": {"width": 1280, "height": 720},
+    }
+    assert ctx.cookies[0]["value"] == "market-cookie"
+
+
+@pytest.mark.parametrize("load", [browser._fetch, browser._fetch_search])
+def test_page_http_429_is_browser_blocked(monkeypatch, load):
+    class Response:
+        status = 429
+
+    class Page:
+        url = "https://www.aliexpress.com/"
+
+        def on(self, *_args):  # noqa: ANN002
+            pass
+
+        def goto(self, *_args, **_kwargs):  # noqa: ANN002, ANN003
+            return Response()
+
+        def close(self):
+            pass
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(browser, "_ensure", lambda: object())
+    monkeypatch.setattr(browser, "_context", lambda _browser: Context())
+    with pytest.raises(browser.BrowserBlocked, match="HTTP 429"):
+        load("1005006730849854" if load is browser._fetch else "https://example.test/")

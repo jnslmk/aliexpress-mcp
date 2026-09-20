@@ -110,6 +110,10 @@ _BASE_HEADERS = {
     "Accept-Language": f"{LOCALE.replace('_', '-')},{LOCALE.split('_')[0]};q=0.9,en;q=0.8",
     "Referer": "https://www.aliexpress.com/",
 }
+# MTop endpoints return JSON/JSONP; do not inherit the navigation document
+# Accept header from the shared session.
+_MTOP_HEADERS = {"Accept": "application/json, text/plain, */*"}
+
 
 # --------------------------------------------------------------------------- #
 # MTop constants
@@ -197,6 +201,14 @@ def _pace() -> None:
     time.sleep(random.uniform(*_REQUEST_GAP_S))
 
 
+def _backoff_delay(attempt: int, retry_after: Optional[float] = None) -> float:
+    """Compute the capped delay without sleeping (easy to test directly)."""
+    delay = min(_BACKOFF_BASE_S * 2 ** (attempt - 1), _BACKOFF_CAP_S)
+    if retry_after is not None:
+        delay = max(delay, min(retry_after, _BACKOFF_CAP_S))
+    return delay
+
+
 def _backoff_sleep(attempt: int, retry_after: Optional[float] = None) -> None:
     """Capped exponential backoff before a retry or a fallback transport.
 
@@ -204,10 +216,8 @@ def _backoff_sleep(attempt: int, retry_after: Optional[float] = None) -> None:
     for minutes of waiting would blow the caller's timeout long before the
     wait paid off, and the cooldown logic owns the long-horizon case.
     """
-    delay = min(_BACKOFF_BASE_S * 2 ** (attempt - 1), _BACKOFF_CAP_S)
-    if retry_after is not None:
-        delay = max(delay, min(retry_after, _BACKOFF_CAP_S))
-    time.sleep(delay)
+    time.sleep(_backoff_delay(attempt, retry_after))
+
 
 
 # --------------------------------------------------------------------------- #
@@ -435,6 +445,7 @@ def _search(
         if init_data is None and ("_____tmd_____" in html or "punish" in html.lower()):
             blocked = "TMD challenge"
 
+    browser_failure: Optional[str] = None
     if blocked:
         # The plain HTTP call was anti-bot gated, same as product detail's
         # MTop path — fall back to a real browser loading the very same URL.
@@ -443,17 +454,22 @@ def _search(
         try:
             browser_html = browser.fetch_search_html(full_url)
         except browser.BrowserBlocked as exc:
+            browser_failure = f"BrowserBlocked: {exc}"
             log.warning("browser search fallback was also blocked: %s", exc)
             browser_html = None
         if browser_html:
             init_data = _extract_init_data(browser_html)
+            if init_data is None:
+                browser_failure = "returned HTML without usable product data"
+        elif browser_failure is None:
+            browser_failure = "returned no usable HTML"
 
     if not init_data:
         if blocked:
             raise AliExpressError(
-                f"blocked by AliExpress anti-bot ({blocked}) — the search page "
-                "returned a punish/verification page instead of results, and the "
-                "browser fallback could not clear it either."
+                f"blocked by AliExpress anti-bot ({blocked}) — direct search "
+                f"transport failed: {blocked}; browser fallback could not clear "
+                f"it (browser search transport failed: {browser_failure})."
             )
         raise AliExpressError(
             "could not locate product data in the search page "
@@ -562,7 +578,7 @@ def _mtop_get(api: str, version: str, data_dict: dict) -> dict:
         "data": data_str,
     }
     _pace()
-    resp = session.get(url, params=params, timeout=15)
+    resp = session.get(url, params=params, headers=_MTOP_HEADERS, timeout=15)
     if resp.status_code >= 400:
         # Before this check a 429/5xx body was fed to the JSON parser and came
         # back as a misleading PARSE_ERROR; now the status is classified and
@@ -803,7 +819,10 @@ def _get_product_via_mtop(pid: str) -> tuple[Optional[dict], Optional[str]]:
             log.warning("MTop %s transport failure: %s", api, exc)
             if not exc.retryable:
                 break
-            _backoff_sleep(attempt, exc.retry_after)
+            # Back off only when another MTop API will actually be tried.
+            # The caller owns the single pause before the browser fallback.
+            if attempt < len(_MTOP_APIS):
+                _backoff_sleep(attempt, exc.retry_after)
             continue
         except Exception as exc:  # noqa: BLE001
             failure = f"{api} failed: {exc}"

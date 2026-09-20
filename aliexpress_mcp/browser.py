@@ -101,19 +101,21 @@ def _start() -> tuple[Any, Any]:
 
 
 def _context(browser: Any) -> Any:
-    """A fresh German-market browser context, one per lookup.
+    """A fresh market-context browser context, one per lookup.
 
-    Measured, not assumed: reusing a context across back-to-back lookups gets
-    the *second* one answered with ``FAIL_SYS_USER_VALIDATE / RGV587_ERROR``,
-    while the first request of a fresh context succeeds. The intuition that a
-    warm, already-checked context would be challenged *less* is exactly
-    backwards here — carried-over state is what marks it. Only the Chromium
-    process is reused; contexts are cheap and disposable.
+    Locale follows the client's existing ``AE_LOCALE`` setting. Timezone and
+    viewport keep their current values by default, but are configurable so a
+    non-German market does not have to impersonate Berlin on a 1440x900 screen.
     """
+    from aliexpress_mcp import aliexpress_client
+
     ctx = browser.new_context(
-        locale="de-DE",
-        timezone_id="Europe/Berlin",
-        viewport={"width": 1440, "height": 900},
+        locale=aliexpress_client.LOCALE.replace("_", "-"),
+        timezone_id=os.getenv("AE_TIMEZONE", "Europe/Berlin"),
+        viewport={
+            "width": int(os.getenv("AE_VIEWPORT_WIDTH", "1440")),
+            "height": int(os.getenv("AE_VIEWPORT_HEIGHT", "900")),
+        },
     )
     ctx.add_cookies([{
         "name": "aep_usuc_f",
@@ -193,11 +195,13 @@ def _fetch(pid: str) -> Optional[dict]:
 
     page.on("response", on_response)
     try:
-        page.goto(
+        response = page.goto(
             f"https://de.aliexpress.com/item/{pid}.html",
             wait_until="domcontentloaded",
             timeout=BROWSER_TIMEOUT_MS,
         )
+        if _response_status(response) == 429:
+            raise BrowserBlocked("product page returned HTTP 429 (rate limited)")
         if _is_punish_url(page.url):
             raise BrowserBlocked(f"product page was redirected to {page.url[:120]}")
         # Poll via page.wait_for_timeout rather than a threading.Event: the sync
@@ -292,6 +296,12 @@ def _is_punish_url(url: str) -> bool:
     """True when the page landed on an anti-bot punish/verification URL."""
     return "_____tmd_____" in url or "punish" in url.lower()
 
+def _response_status(response: Any) -> Optional[int]:
+    """Return a Playwright response status across real and fake responses."""
+    status = getattr(response, "status", None)
+    return status() if callable(status) else status
+
+
 
 def _fetch_search(url: str) -> Optional[str]:
     """Load the SSR search page and return its HTML.
@@ -305,7 +315,9 @@ def _fetch_search(url: str) -> Optional[str]:
     ctx = _context(_ensure())
     page = ctx.new_page()
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT_MS)
+        response = page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT_MS)
+        if _response_status(response) == 429:
+            raise BrowserBlocked("search page returned HTTP 429 (rate limited)")
         html = page.content()
         if any(marker in html for marker in _TMD_MARKERS) or _is_punish_url(page.url):
             raise BrowserBlocked(f"search page served an anti-bot punish page ({page.url[:120]})")

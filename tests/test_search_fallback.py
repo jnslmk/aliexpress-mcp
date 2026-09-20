@@ -108,6 +108,16 @@ def test_search_raises_when_the_browser_fallback_also_fails(monkeypatch):
     with pytest.raises(ac.AliExpressError, match="browser fallback could not clear"):
         ac._search("xiaomi cable")
 
+def test_search_reports_the_browser_block_reason(monkeypatch):
+    monkeypatch.setattr(ac, "_get_session", lambda: FakeSession(FakeResponse(BLOCKED_PAGE)))
+
+    def blocked(_url):  # noqa: ANN001
+        raise ac.browser.BrowserBlocked("HTTP 429 (rate limited)")
+
+    monkeypatch.setattr(ac.browser, "fetch_search_html", blocked)
+    with pytest.raises(ac.AliExpressError, match="browser search transport failed: BrowserBlocked: HTTP 429"):
+        ac._search("xiaomi cable")
+
 
 def test_search_does_not_treat_a_parser_miss_as_a_block(monkeypatch):
     """Missing/changed JSON shape must not silently try the browser and hide the real error."""
