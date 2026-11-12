@@ -15,8 +15,8 @@ mechanisms (ported from Averyy/fetchaller-mcp, MIT):
      ``_m_h5_tk`` token the site hands out on a deliberately unsigned request,
      plus an MD5 signature ``MD5(token & timestamp & appKey & data)``.
 
-  2. A **browser** that loads the product page and hands back the very same
-     MTop response the page fetches for itself. See ``browser.py``.
+  2. An **Obscura browser** that loads the product page and calls its native
+     MTop SDK with the observed request parameters. See ``browser.py``.
 
   3. An **SSR composite fallback** for when the browser is unavailable. See
      ``_get_product_via_ssr``.
@@ -38,19 +38,16 @@ mechanisms (ported from Averyy/fetchaller-mcp, MIT):
     client-side rendered: ``window.runParams`` ships **empty** and the page
     fetches its own data from that same MTop endpoint.
 
-  Hence path 2, which is not a reimplementation of the anti-bot JS but simply
-  a reader of the answer the page already obtains. The payload is identical, so
-  ``_extract_product`` parses it unchanged.
+  Hence path 2: the site's SDK owns token refresh and signing, and returns the
+  same MTop schema, which ``_extract_product`` parses unchanged.
 
 All of this is fragile by nature — AliExpress can change the embedded-JSON
 shape, the MTop signing scheme, or start returning anti-bot (``x5sec`` /
 ``RGV587``) challenges at any time. Every extractor is written defensively and
 failures degrade to a clear, partial answer rather than a crash.
 
-TLS fingerprinting via ``curl_cffi`` (Chrome impersonation) is what lets a
-head-less, browser-less container talk to AliExpress without immediately
-tripping bot detection — no Selenium/Chromium needed, so the container stays
-tiny and its root filesystem read-only.
+TLS fingerprinting via ``curl_cffi`` keeps ordinary search HTTP-first. Browser
+fallback uses a private Obscura service rather than downloading Chromium.
 
 Market defaults to Germany / EUR / de_DE; override via ``AE_REGION`` /
 ``AE_CURRENCY`` / ``AE_LOCALE``.
@@ -1014,10 +1011,9 @@ def _get_product_via_ssr(pid: str, mtop_note: str) -> dict:
 def _get_product_via_browser(pid: str) -> Optional[dict]:
     """Full record via a real browser, or ``None`` if it could not be had.
 
-    The browser loads the product page and we intercept the very same
-    ``pdp.pc.query`` response the page fetches for itself, so the payload is
-    byte-identical to what direct MTop returned before it was gated — and
-    ``_extract_product`` parses it unchanged.
+    The page's native SDK requests JSON with the observed PDP parameters.
+    Signing and token refresh stay with AliExpress; ``_extract_product`` handles
+    the unchanged MTop schema.
     """
     payload = browser.fetch_pdp_payload(pid)
     if not payload:
@@ -1043,7 +1039,7 @@ def _get_product(product: str) -> dict:
     1. **Direct MTop** — one signed HTTP call. Currently anti-bot gated, but
        still tried (outside its cooldown) so the full record comes back
        automatically the day AliExpress ungates it.
-    2. **Browser** — drives the page and intercepts its own MTop response.
+    2. **Browser** — drives the page and requests JSON through its native SDK.
        Same full record; costs a page load, so it is not the first choice.
     3. **SSR composite** — product page + search. Partial, and only a last
        resort for when the browser is disabled or cannot run.

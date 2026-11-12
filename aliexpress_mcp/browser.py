@@ -1,55 +1,33 @@
-"""Browser transport for product detail and search.
+"""Serial browser transport using a private, worker-owned Obscura CDP service.
 
-AliExpress gates the MTop product-detail endpoints against *non-browser*
-clients: `curl_cffi` with Chrome TLS impersonation gets
-``FAIL_SYS_USER_VALIDATE / RGV587_ERROR`` and a captcha url, while a real
-Chromium on the *same IP*, not logged in, gets ``SUCCESS`` and a ~95 KB
-payload. TLS impersonation is not enough — the anti-bot wants the JavaScript
-executed. The SSR search page is gated the same way under load: a plain HTTP
-client gets a ``_____tmd_____`` punish page in place of the embedded
-``_init_data_`` JSON, while a real browser clears the same challenge.
-
-So rather than reimplement that JS, this drives the page and reads the answer
-it fetches for itself:
-
-* **Product detail** — load ``/item/<id>.html``, intercept the
-  ``mtop.aliexpress.pdp.pc.query`` XHR, hand the JSON to the existing
-  ``_extract_product``. That parser is unchanged from the direct-MTop days —
-  same endpoint, same schema, different transport.
-* **Search** — load the same SSR search URL the plain HTTP path would have
-  fetched and return its rendered HTML; ``_extract_init_data`` parses it
-  unchanged, since it is the same server-rendered page either way.
-
-Two hard constraints shape the design:
-
-* **Playwright's sync objects are bound to the thread that created them**, and
-  FastMCP dispatches sync tools onto an arbitrary worker thread. Everything
-  here therefore runs on one dedicated single-worker executor.
-* **Browser work must stay serialised.** Chromium is the memory cost of this
-  container, and concurrent page loads are also the fastest way back onto
-  AliExpress's anti-bot list.
-
-Uses `patchright` — a drop-in Playwright fork with anti-detection patches,
-already the house choice in the sibling baumarkt-mcp.
+Search remains HTTP-first. Product detail loads the real market page, then
+asks its native MTop SDK for JSON using the page's observed request parameters.
+The provider SDK alone owns signing and token refresh; no credentials are replayed.
+Every lookup gets a fresh market context on the existing single-worker executor.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
 import random
+import signal
+import socket
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
+from urllib.parse import urlsplit
+from urllib.request import ProxyHandler, build_opener
 
 log = logging.getLogger("aliexpress-mcp")
 
 BROWSER_ENABLED = os.getenv("AE_BROWSER_ENABLED", "true").lower() not in {"0", "false", "no"}
 # Wall-clock budget for one product lookup: navigation plus the page's own XHR.
 BROWSER_TIMEOUT_MS = int(os.getenv("AE_BROWSER_TIMEOUT_MS", "45000"))
-HEADLESS = os.getenv("AE_BROWSER_HEADLESS", "true").lower() not in {"0", "false", "no"}
 # AliExpress challenges a proportion of loads; a fresh context usually clears it.
 BROWSER_ATTEMPTS = max(1, int(os.getenv("AE_BROWSER_ATTEMPTS", "3")))
 BROWSER_RETRY_DELAY_S = float(os.getenv("AE_BROWSER_RETRY_DELAY_S", "1.5"))
@@ -60,6 +38,7 @@ _PDP_API = "mtop.aliexpress.pdp.pc.query"
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ae-browser")
 _state: dict[str, Any] = {}
 _state_lock = threading.Lock()
+_shutting_down = threading.Event()
 
 
 class BrowserUnavailable(RuntimeError):
@@ -74,30 +53,85 @@ class BrowserBlocked(RuntimeError):
     """
 
 
-def _start() -> tuple[Any, Any]:
-    """Start Playwright + Chromium. Runs on the worker thread only."""
+def _stop_service() -> None:
+    """Reap the CLI and all workers, including children of an exited CLI."""
+    process = _state.pop("service", None)
+    if process is None:
+        return
     try:
-        from patchright.sync_api import sync_playwright
-    except ImportError:  # pragma: no cover - depends on the image build
         try:
-            from playwright.sync_api import sync_playwright  # type: ignore
-        except ImportError as exc:
-            raise BrowserUnavailable(
-                "no browser driver installed (expected patchright or playwright)"
-            ) from exc
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
 
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(
-        headless=HEADLESS,
-        args=[
-            # Chromium's sandbox needs privileges the container deliberately
-            # drops; the process is already confined by the container itself.
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ],
-    )
-    return pw, browser
+
+def _start() -> tuple[Any, Any]:
+    """Start loopback-only Obscura and connect ordinary Playwright over CDP."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:  # pragma: no cover - depends on the image build
+        raise BrowserUnavailable("Playwright is not installed") from exc
+
+    pw = None
+    try:
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        env = os.environ.copy()
+        env["OBSCURA_NAV_TIMEOUT_MS"] = str(BROWSER_TIMEOUT_MS)
+        # Do not forward provider console output: it can contain tokens/URLs.
+        process = subprocess.Popen(
+            [os.getenv("AE_OBSCURA_BINARY", "/opt/obscura/obscura"),
+             "serve", "--host", "127.0.0.1", "--port", str(port),
+             "--max-connections", "6", "--stealth"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _state["service"] = process
+        endpoint = f"http://127.0.0.1:{port}"
+        deadline = time.monotonic() + 30
+        opener = build_opener(ProxyHandler({}))
+        while True:
+            if _shutting_down.is_set():
+                raise BrowserUnavailable("Obscura is shutting down")
+            if process.poll() is not None:
+                raise BrowserUnavailable(f"Obscura exited during startup (status {process.returncode})")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BrowserUnavailable("Obscura CDP startup exceeded 30 seconds")
+            try:
+                with opener.open(f"{endpoint}/json/version", timeout=min(1, remaining)) as response:
+                    ready = bool(json.load(response).get("webSocketDebuggerUrl"))
+                if ready:
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(min(0.1, remaining))
+        pw = sync_playwright().start()
+        browser = pw.chromium.connect_over_cdp(
+            endpoint, timeout=max(1, int((deadline - time.monotonic()) * 1000)),
+        )
+        return pw, browser
+    except Exception as exc:
+        _stop_service()
+        if pw is not None:
+            try:
+                pw.stop()
+            except Exception:  # noqa: BLE001 - preserve the startup failure
+                pass
+        if isinstance(exc, BrowserUnavailable):
+            raise
+        raise BrowserUnavailable(f"Obscura startup failed ({type(exc).__name__})") from None
 
 
 def _context(browser: Any) -> Any:
@@ -130,6 +164,13 @@ def _context(browser: Any) -> Any:
         "domain": ".aliexpress.com",
         "path": "/",
     }])
+    locale = aliexpress_client.LOCALE.replace("_", "-")
+    language = locale.split("-", 1)[0]
+    accept_language = f"{locale},{language};q=0.9" if locale != language else language
+    # CDP extra headers do not reach Obscura's stealth HTTP client; routing does.
+    ctx.route("**/*", lambda route: route.continue_(
+        headers=dict(route.request.headers) | {"accept-language": accept_language},
+    ))
     ctx.set_default_timeout(BROWSER_TIMEOUT_MS)
     return ctx
 
@@ -142,17 +183,22 @@ def _usuc_cookie() -> str:
 
 
 def _ensure() -> Any:
-    """Lazily start Chromium; return the browser. Worker thread only."""
+    """Lazily start Obscura; return the browser. Worker thread only."""
+    if _shutting_down.is_set():
+        raise BrowserUnavailable("Obscura is shutting down")
     if "browser" in _state:
-        return _state["browser"]
+        if _state["browser"].is_connected() and _state["service"].poll() is None:
+            return _state["browser"]
+        _teardown()
     pw, browser_obj = _start()
     _state["pw"], _state["browser"] = pw, browser_obj
-    log.info("browser transport started (headless=%s)", HEADLESS)
+    log.info("browser transport started (Obscura stealth, loopback CDP)")
     return browser_obj
 
 
 def _teardown() -> None:
     """Drop everything so the next call starts clean. Worker thread only."""
+    _stop_service()
     for key in ("browser", "pw"):
         obj = _state.pop(key, None)
         if obj is None:
@@ -164,87 +210,85 @@ def _teardown() -> None:
 
 
 def _fetch(pid: str) -> Optional[dict]:
-    """Load the product page and return its own pdp.pc.query JSON. Worker only."""
+    """Return successful native-SDK PDP JSON within one attempt's budget."""
     from aliexpress_mcp import aliexpress_client
 
     ctx = _context(_ensure())
-    page = ctx.new_page()
+    page = None
+    deadline = time.monotonic() + BROWSER_TIMEOUT_MS / 1000
     captured: dict[str, Any] = {}
 
     def on_response(resp: Any) -> None:
-        if _PDP_API not in resp.url or "payload" in captured:
+        target = urlsplit(resp.url)
+        if (target.scheme != "https" or target.hostname != "acs.aliexpress.com"
+                or target.path.lower() != f"/h5/{_PDP_API}/1.0/"):
             return
-        try:
-            body = resp.text()
-        except Exception:  # noqa: BLE001 - a body we cannot read is not a payload
-            return
-        start, end = body.find("{"), body.rfind("}")
-        if start == -1 or end <= start:
-            return
-        try:
-            obj = json.loads(body[start:end + 1])
-        except json.JSONDecodeError:
-            return
-        # The page's first pdp call is the unsigned token bootstrap and comes
-        # back FAIL_SYS_TOKEN_EMPTY; the signed retry carries the data. Waiting
-        # for SUCCESS rather than for "a response" is what makes that a
-        # non-issue instead of an intermittent empty result.
-        ret = " ".join(obj.get("ret") or [])
-        if "SUCCESS" in ret:
-            captured["payload"] = obj
-        else:
-            # Logged, because "the browser was challenged" and "the browser
-            # never got a response" are different faults with the same symptom
-            # (an empty result after the full timeout).
-            captured.setdefault("rets", []).append(ret[:60])
+        captured.setdefault("url", resp.url)
+        if _response_status(resp) == 429:
+            captured["rate_limited"] = True
 
-    page.on("response", on_response)
     try:
-        # Hit the same market the context impersonates: a de. page under an
-        # es_ES locale is the mismatch the market config exists to avoid.
-        # English has no subdomain; www is the English storefront.
+        page = ctx.new_page()
+        page.on("response", on_response)
         lang = aliexpress_client.LOCALE.split("_")[0].lower()
         host = "www" if lang == "en" else lang
         response = page.goto(
             f"https://{host}.aliexpress.com/item/{pid}.html",
             wait_until="domcontentloaded",
-            timeout=BROWSER_TIMEOUT_MS,
+            timeout=max(1, int((deadline - time.monotonic()) * 1000)),
         )
         if _response_status(response) == 429:
             raise BrowserBlocked("product page returned HTTP 429 (rate limited)")
+        while "url" not in captured and time.monotonic() < deadline:
+            if _is_punish_url(page.url):
+                raise BrowserBlocked("product page redirected to an anti-bot punish page")
+            page.wait_for_timeout(min(250, max(1, (deadline - time.monotonic()) * 1000)))
         if _is_punish_url(page.url):
-            raise BrowserBlocked(f"product page was redirected to {page.url[:120]}")
-        # Poll via page.wait_for_timeout rather than a threading.Event: the sync
-        # Playwright API only dispatches "response" events while control is
-        # inside a Playwright call, so blocking on an Event would park this
-        # thread with the handler never firing — the page loads, the payload
-        # arrives, and we time out having seen nothing.
-        waited = 0
-        step = 250
-        while "payload" not in captured and waited < BROWSER_TIMEOUT_MS:
-            page.wait_for_timeout(step)
-            waited += step
-            # Once the page has been told "RGV587" there is nothing left to
-            # wait for — it will not retry itself. Bail out at once and let the
-            # caller open a fresh context rather than sit out the full timeout;
-            # this is the difference between a ~2s retry and a 45s dead wait.
-            if any("RGV587" in r for r in captured.get("rets", [])):
-                break
-        payload = captured.get("payload")
-        if payload is None:
-            log.info(
-                "browser saw no successful %s for %s in %sms (pdp replies: %s; "
-                "page url: %s)",
-                _PDP_API, pid, waited,
-                captured.get("rets") or "none", page.url[:120],
-            )
-        return payload
+            raise BrowserBlocked("product page redirected to an anti-bot punish page")
+        if captured.get("rate_limited"):
+            raise BrowserBlocked("product API returned HTTP 429 (rate limited)")
+        remaining = int((deadline - time.monotonic()) * 1000)
+        if "url" not in captured or remaining <= 0:
+            return None
+        answer = page.evaluate("""async ({url, budget}) => {
+            const sdk = window.lib && window.lib.mtop;
+            if (!sdk || typeof sdk.request !== 'function') return null;
+            const params = new URL(url).searchParams;
+            if (!['api', 'v', 'appKey', 'data'].every(key => params.has(key))) return null;
+            let timer;
+            try {
+                const options = {api: params.get('api'), v: params.get('v'),
+                    appKey: params.get('appKey'), data: JSON.parse(params.get('data')),
+                    type: 'get', dataType: 'json', H5Request: true,
+                    timeout: Math.min(10000, budget)};
+                return await Promise.race([
+                    Promise.resolve(sdk.request(options)).catch(payload =>
+                        payload && typeof payload === 'object' && 'ret' in payload ? payload : null),
+                    new Promise(resolve => { timer = setTimeout(() => resolve(null), budget); })
+                ]);
+            } catch (_) { return null; }
+            finally { clearTimeout(timer); }
+        }""", {"url": captured["url"], "budget": remaining})
+        if captured.get("rate_limited"):
+            raise BrowserBlocked("product API returned HTTP 429 (rate limited)")
+        if _is_punish_url(page.url):
+            raise BrowserBlocked("product page redirected to an anti-bot punish page")
+        # A rejected SDK promise can carry a real MTop error object. Never hand
+        # its data to the parser as if a completed request meant SUCCESS.
+        ret = answer.get("ret") if isinstance(answer, dict) else None
+        if isinstance(ret, list) and any(
+            isinstance(code, str) and (code == "SUCCESS" or code.startswith("SUCCESS::"))
+            for code in ret
+        ):
+            return answer
+        return None
     finally:
         for obj in (page, ctx):
-            try:
-                obj.close()
-            except Exception:  # noqa: BLE001
-                pass
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:  # noqa: BLE001 - preserve the lookup error
+                    pass
 
 
 def _retry_delay(attempt: int) -> float:
@@ -266,6 +310,8 @@ def _run_guarded(label: str, load: Any) -> Optional[Any]:
     """
     last_exc: Optional[Exception] = None
     for attempt in range(1, BROWSER_ATTEMPTS + 1):
+        if _shutting_down.is_set():
+            return None
         try:
             result = load()
             if result:
@@ -277,7 +323,9 @@ def _run_guarded(label: str, load: Any) -> Optional[Any]:
             raise
         except Exception as exc:  # noqa: BLE001 - a bad page must not wedge the browser
             last_exc = exc
-            log.info("%s errored (%s); restarting browser", label, exc)
+            log.info("%s errored (%s); restarting browser", label, type(exc).__name__)
+            if isinstance(exc, BrowserUnavailable):
+                log.warning("browser unavailable: %s", exc)
             _teardown()
         if attempt < BROWSER_ATTEMPTS:
             time.sleep(_retry_delay(attempt))
@@ -345,7 +393,7 @@ def _fetch_search(url: str) -> Optional[str]:
             raise BrowserBlocked("search page returned HTTP 429 (rate limited)")
         html = page.content()
         if any(marker in html for marker in _TMD_MARKERS) or _is_punish_url(page.url):
-            raise BrowserBlocked(f"search page served an anti-bot punish page ({page.url[:120]})")
+            raise BrowserBlocked("search page served an anti-bot punish page")
         return html
     finally:
         for obj in (page, ctx):
@@ -369,9 +417,19 @@ def fetch_search_html(url: str) -> Optional[str]:
 
 
 def shutdown() -> None:
-    """Best-effort browser teardown (tests, or a clean process exit)."""
+    """Stop accepting browser work and reap the service on clean process exit."""
+    _shutting_down.set()
+    # Kill the owned group before queueing behind an in-flight Playwright call.
+    # Waiting for that call first can outlast a service manager's TERM grace.
+    _stop_service()
     with _state_lock:
         try:
             _executor.submit(_teardown).result(timeout=30)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - still kill the service if worker is stuck
             pass
+        finally:
+            _stop_service()
+
+
+# The executor is already joined when atexit runs; only process cleanup belongs here.
+atexit.register(_stop_service)

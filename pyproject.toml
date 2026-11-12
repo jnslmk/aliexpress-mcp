@@ -8,10 +8,8 @@ license = { text = "MIT" }
 dependencies = [
     "fastmcp>=3.4.4",
     "curl_cffi>=0.7.0",
-    # Browser transport for product detail (see browser.py). patchright is a
-    # drop-in Playwright fork with anti-detection patches, same choice as the
-    # sibling baumarkt-mcp.
-    "patchright>=1.49",
+    # Ordinary Playwright CDP client; Obscura supplies the browser runtime.
+    "playwright==1.63.0",
 ]
 
 [project.scripts]

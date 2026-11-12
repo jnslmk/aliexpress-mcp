@@ -398,9 +398,74 @@ def test_browser_path_reports_a_delisted_product(monkeypatch):
         ac._get_product_via_browser(PID)
 
 
+@pytest.mark.parametrize(
+    "ret,partial",
+    [
+        (["SUCCESS::调用成功"], False),
+        (["FAIL_SYS_USER_VALIDATE::challenge"], True),
+        (["NOT_SUCCESS"], True),
+        (None, True),  # SDK timeout resolves to null, not a successful payload.
+    ],
+)
+def test_native_sdk_failure_cannot_masquerade_as_full_detail(monkeypatch, item_page, ret, partial):
+    from types import SimpleNamespace
+
+    transport = ac.browser
+    payload = None if ret is None else {
+        "ret": ret,
+        # Even an error object carrying product-shaped data must not be parsed.
+        "data": {"result": {
+            "PRODUCT_TITLE": {"text": "SDK product"},
+            "GLOBAL_DATA": {"globalData": {"productId": PID}},
+        }},
+    }
+    closed = []
+
+    class Page:
+        url = f"https://de.aliexpress.com/item/{PID}.html"
+
+        def on(self, event, callback):
+            self.callback = callback
+
+        def goto(self, *_args, **_kwargs):
+            self.callback(SimpleNamespace(
+                url="https://acs.aliexpress.com/h5/mtop.aliexpress.pdp.pc.query/1.0/"
+                    "?api=mtop.aliexpress.pdp.pc.query&v=1.0&appKey=observed&data=%7B%7D",
+                status=200,
+            ))
+            return SimpleNamespace(status=200)
+
+        def evaluate(self, *_args):
+            return payload
+
+        def close(self):
+            closed.append("page")
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+        def close(self):
+            closed.append("context")
+
+    monkeypatch.setattr(transport, "_ensure", lambda: object())
+    monkeypatch.setattr(transport, "_context", lambda _browser: Context())
+    monkeypatch.setattr(transport, "BROWSER_ATTEMPTS", 1)
+    monkeypatch.setattr(transport, "BROWSER_ENABLED", True)
+    monkeypatch.setattr(ac, "_get_product_via_mtop", lambda pid: (None, None))
+    monkeypatch.setattr(ac, "_search", lambda *a, **k: {"items": [SEARCH_HIT]})
+    record = ac.get_product(PID)
+    assert record["id"] == PID
+    assert record["partial"] is partial
+    assert record["source"] == ("ssr+search" if partial else "browser")
+    assert record["title"] == (SEARCH_HIT["title"] + " 6A Turbo-Schnellladung für Mi 17 Pro"
+                               if partial else "SDK product")
+    assert closed == ["page", "context"]
+
+
 def test_browser_transport_is_disabled_by_env(monkeypatch):
     monkeypatch.setattr(ac.browser, "BROWSER_ENABLED", False)
-    # Must not try to start Chromium when switched off.
+    # Must not start Obscura when switched off.
     assert ac.browser.fetch_pdp_payload(PID) is None
 
 
