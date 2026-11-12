@@ -6,6 +6,13 @@
 * Use AliExpress's native MTop SDK JSON transport with observed request parameters, provider-owned signing/token refresh, market-header forwarding and a shared navigation/request deadline.
 * Reap the owned Obscura process group promptly on CLI SIGTERM (HTTP or stdio), before waiting for blocked browser work; scope and restore the CLI signal handler.
 
+## [0.4.0](https://github.com/jnslmk/aliexpress-mcp/compare/v0.3.3...v0.4.0) (2026-11-12)
+
+
+### Features
+
+* **browser:** replace chromium with obscura ([#4](https://github.com/jnslmk/aliexpress-mcp/issues/4)) ([6db2d06](https://github.com/jnslmk/aliexpress-mcp/commit/6db2d0619d0149a5086f0a6ddb9bbebe76736f03))
+
 ## [0.3.3](https://github.com/jnslmk/aliexpress-mcp/compare/v0.3.2...v0.3.3) (2026-09-20)
 
 
