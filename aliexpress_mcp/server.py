@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 from typing import Annotated, Any, Optional
 
 from fastmcp import FastMCP
@@ -266,16 +267,31 @@ def main() -> None:
     )
     log.info("aliexpress-mcp starting (market=%s currency=%s locale=%s)", REGION, CURRENCY, LOCALE)
 
-    transport = os.getenv("MCP_TRANSPORT", "http")
-    if transport == "stdio":
-        mcp.run(transport="stdio")
-    else:
-        mcp.run(
-            transport="http",
-            host=os.getenv("MCP_HOST", "0.0.0.0"),  # noqa: S104 - containerised
-            port=int(os.getenv("MCP_PORT", "8000")),
-            path=os.getenv("MCP_PATH", "/mcp"),
-        )
+    from aliexpress_mcp import browser
+
+    def terminate(signum: int, _frame: Any) -> None:
+        # Uvicorn restores and re-raises captured signals after its HTTP drain.
+        # Turn both that re-raise and stdio SIGTERM into Python unwinding.
+        raise SystemExit(128 + signum)
+
+    previous_sigterm = signal.signal(signal.SIGTERM, terminate)
+
+    try:
+        transport = os.getenv("MCP_TRANSPORT", "http")
+        if transport == "stdio":
+            mcp.run(transport="stdio")
+        else:
+            mcp.run(
+                transport="http",
+                host=os.getenv("MCP_HOST", "0.0.0.0"),  # noqa: S104 - containerised
+                port=int(os.getenv("MCP_PORT", "8000")),
+                path=os.getenv("MCP_PATH", "/mcp"),
+            )
+    finally:
+        try:
+            browser.shutdown()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

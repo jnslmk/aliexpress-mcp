@@ -9,23 +9,21 @@ the aliexpress.com web frontend does:
 - **Search** — fetches the server-rendered search page
   (`/w/wholesale-<query>.html`) and pulls the product list out of the
   `_init_data_` JSON the page embeds for its own hydration. On an anti-bot
-  (TMD) punish page it falls back to loading the same URL in a headless
-  browser.
+  (TMD) punish page it falls back to loading the same URL in Obscura.
 - **Product detail** — tries AliExpress's internal **MTop** API
-  (`acs.aliexpress.com`) first, which needs an `_m_h5_tk` token (bootstrapped on
-  the first request) and an MD5 request signature `MD5(token & timestamp &
-  appKey & data)`. MTop is anti-bot gated for plain HTTP clients today, so a
-  headless Chromium loads the product page and the server intercepts the very
-  same MTop response the page fetches for itself. See
+  (`acs.aliexpress.com`) first. When gated, Obscura loads the market's product
+  page and calls its native MTop SDK with the observed `api`, `v`, `appKey`
+  and `data`, requesting credentialed JSON instead of automatic JSONP.
+  The provider SDK retains signing and token refresh. See
   [how product detail is fetched](#how-product-detail-is-fetched-and-why-a-browser).
 
 TLS fingerprinting via [`curl_cffi`](https://github.com/lexiforest/curl_cffi)
 (Chrome impersonation) is usually enough for search, which tries a plain HTTP
-call first. Product detail is gated on executed JavaScript rather than TLS
-fingerprint, so it needs a real browser (headless Chromium, via
-[`patchright`](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright)); search
-falls back to the same browser transport when its plain HTTP call is
-anti-bot challenged.
+call first. Browser fallback uses ordinary
+[Playwright](https://playwright.dev/python/) over a private loopback CDP service
+owned by the serial worker, running
+[Obscura v0.2.6](https://github.com/h4ckf0r0day/obscura/releases/tag/v0.2.6)
+with rendering and stealth enabled. No Chromium download, Xvfb or public CDP port.
 
 It is **read-only**: it searches and reads listings, it cannot buy.
 
@@ -42,48 +40,45 @@ search). On an anti-bot block or a transport error the tool returns
 
 ### How product detail is fetched (and why a browser)
 
-As of **2026-08-08** AliExpress answers the MTop product-detail endpoints
-(`mtop.aliexpress.pdp.pc.query`, `…itemdetail.pc.asyncPCDetail`) with
-`FAIL_SYS_USER_VALIDATE` / `RGV587_ERROR` and a captcha url instead of data,
-when called over plain HTTP. Four things were checked rather than assumed:
-
-- **Not an IP-reputation problem.** A residential IP is refused exactly like a
-  datacenter one, in the same minute.
-- **Not a token or signing regression.**
-  `mtop.relationrecommend.aliexpressrecommend.recommend` still mints an
-  `_m_h5_tk` normally, and signing the pdp call with that fresh token is
-  refused just the same.
-- **Not login-gated, and the endpoint is not dead.** A real Chromium — *not*
-  logged in, on the *same IP*, and headless at that — gets `SUCCESS` and a
-  ~95 KB payload from that exact endpoint. What the anti-bot wants is the
-  JavaScript executed; `curl_cffi`'s Chrome TLS impersonation is not enough on
-  its own.
-- **The product page cannot stand in for it.** `/item/<id>.html` is now
-  client-side rendered, ships an empty `window.runParams`, and fetches its own
-  data from that same endpoint.
-
-So detail uses three transports, cheapest first:
+AliExpress can gate direct MTop calls with `FAIL_SYS_USER_VALIDATE` /
+`RGV587_ERROR`. Detail retains three transports, cheapest first:
 
 | # | Transport | Result |
 |---|---|---|
-| 1 | Direct MTop over HTTP | Currently gated. Still tried first, so the cheap path resumes automatically if AliExpress ungates it |
-| 2 | **Browser** — load the page, intercept its own `pdp.pc.query` response | **Full record.** ~2 s warm. `source: "browser"` |
-| 3 | SSR composite — product page + search results | Partial. Only if the browser is disabled or fails. `source: "ssr+search"`, `partial: true` |
+| 1 | Direct MTop over HTTP | Tried outside the existing anti-bot cooldown |
+| 2 | **Obscura** — load the page and request JSON through its native MTop SDK | Full record, `source: "browser"`, `partial: false` |
+| 3 | SSR composite — product page + search results | Explicitly partial, `source: "ssr+search"`, `partial: true` |
 
-Transport 2 does not reimplement the anti-bot JavaScript; it just reads the
-answer the page already obtains for itself. The payload is byte-identical to
-what direct MTop used to return, so the same parser handles it unchanged.
+The browser uses only parameters from the real first-party PDP request, not a
+custom signer, copied token or fabricated API request. JSON avoids Obscura's
+cross-origin dynamic-script credential limitation while preserving the site's
+SDK bootstrap and refresh behavior. Only an explicit MTop `SUCCESS` reaches
+the unchanged rich-product parser; SDK errors and timeouts retain the existing
+fallback semantics.
 
-Two behaviours here were measured, not guessed, and both are counter-intuitive:
+Each attempt uses a fresh context with the configured locale, timezone,
+viewport and shared `aep_usuc_f` market cookie. Routed `Accept-Language` headers
+also reach Obscura's stealth HTTP client. Navigation, request observation and
+SDK completion share one per-attempt deadline. Existing bounded attempts and
+backoff remain; clear punish pages and HTTP 429 stop immediately.
 
-- **A fresh browser context per lookup, not a warm one.** Reusing a context got
-  the *second* back-to-back lookup answered with RGV587, while the first request
-  of a fresh context succeeds. Carried-over state is what marks you.
-- **Bail out the instant RGV587 arrives.** The page will not retry itself, so
-  waiting out the timeout buys nothing — detecting it and retrying in a fresh
-  context turns a 45 s dead wait into a ~2 s retry. AliExpress challenges a
-  *proportion* of loads rather than locking on, so a capped retry
-  (`AE_BROWSER_ATTEMPTS`, default 3) recovers almost all of them.
+The Docker image verifies the official render-enabled stealth archive's SHA-256
+before installing both CLI and worker binaries (Linux amd64/arm64). The worker
+starts CDP on an ephemeral loopback port with a 30-second startup limit, reaps
+its entire process group on restart/shutdown and suppresses provider console
+output, which can contain credentials. Native runtime requirements are CA
+certificates, libstdc++ and glibc 2.34 (amd64) / 2.35 (arm64); Debian bookworm supplies these.
+
+The CLI entrypoint handles SIGTERM for both HTTP and stdio, including Uvicorn's
+captured-signal re-raise. Shutdown first disables restarts and stops the owned
+process group (TERM, then KILL within three seconds), before draining the
+browser worker. Signal handlers are installed only while `server.main()` runs
+and restored afterward; embedding callers must explicitly call
+`browser.shutdown()`. An uncatchable SIGKILL still requires supervisor/cgroup
+cleanup.
+
+For a local install, provision the same official binary pair together and set
+`AE_OBSCURA_BINARY` to the CLI path. The default is `/opt/obscura/obscura`.
 
 ## Market (Germany / EUR by default)
 
@@ -100,8 +95,8 @@ vars (defaults in **bold**):
 | `AE_BROWSER_ENABLED` | **`true`** | Browser transport for product detail (0.3.0+). Set `false` to run browser-less; detail then degrades to the partial `ssr+search` record. |
 | `AE_BROWSER_ATTEMPTS` | **`3`** | Attempts per lookup, each in a fresh context. AliExpress challenges a proportion of loads; a retry usually clears it. |
 | `AE_BROWSER_RETRY_DELAY_S` | **`1.5`** | Pause between attempts. Retrying instantly is what the anti-bot watches for. |
-| `AE_BROWSER_TIMEOUT_MS` | **`45000`** | Per-attempt budget. Rarely reached: a challenged attempt aborts as soon as RGV587 arrives. |
-| `AE_BROWSER_HEADLESS` | **`true`** | Headless suffices for AliExpress (verified). Unlike the sibling baumarkt-mcp, no Xvfb/headed display is needed. |
+| `AE_BROWSER_TIMEOUT_MS` | **`45000`** | Per-attempt navigation + SDK wall-clock budget; also sets Obscura's navigation deadline. |
+| `AE_OBSCURA_BINARY` | **`/opt/obscura/obscura`** | Official render-enabled stealth CLI, alongside its `obscura-worker` binary. |
 | `AE_TIMEZONE` | **`Europe/Berlin`** | Timezone the browser context impersonates; tune it when targeting a non-German market. |
 | `AE_VIEWPORT_WIDTH` | **`1440`** | Browser viewport width. |
 | `AE_VIEWPORT_HEIGHT` | **`900`** | Browser viewport height. |
